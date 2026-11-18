@@ -136,3 +136,9 @@ async def test_state_snapshot_shape(client):
     assert {"system", "portfolio", "agents", "positions", "pipeline", "watchlist", "risk"} <= set(s)
     assert [a["name"] for a in s["agents"]] == ["scanner", "rugcheck", "sizer", "executor", "logger", "equity"]
     assert s["portfolio"]["capital"]["starting_inr"] == 50000
+
+
+async def test_unknown_config_key_rejected(client):
+    await login(client)
+    r = await client.put("/api/config/risk", json={"max_leverag": 10}, headers=H)
+    assert r.status_code == 400

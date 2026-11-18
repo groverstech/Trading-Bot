@@ -8,10 +8,15 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .db import Database, dumps, loads
 from .util import now
+
+class Strict(BaseModel):
+    """Unknown keys are rejected so a typo can never be silently ignored."""
+    model_config = ConfigDict(extra="forbid")
+
 
 DEFAULT_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
@@ -20,7 +25,7 @@ DEFAULT_SYMBOLS = [
 TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
 
 
-class CapitalCfg(BaseModel):
+class CapitalCfg(Strict):
     starting_inr: float = Field(50_000, gt=0)
     spot_pct: float = Field(40, ge=0, le=100)
     futures_pct: float = Field(30, ge=0, le=100)
@@ -34,7 +39,7 @@ class CapitalCfg(BaseModel):
         return self
 
 
-class RiskCfg(BaseModel):
+class RiskCfg(Strict):
     risk_per_trade_pct: float = Field(0.5, gt=0, le=5)
     max_risk_per_trade_pct: float = Field(1.0, gt=0, le=5)
     max_daily_loss_pct: float = Field(2.0, gt=0, le=50)
@@ -66,7 +71,7 @@ class RiskCfg(BaseModel):
         return self
 
 
-class RugCheckCfg(BaseModel):
+class RugCheckCfg(Strict):
     min_quote_volume_24h: float = Field(20_000_000, ge=0)
     max_spread_bps: float = Field(8, gt=0)
     # Liquidity within +/- depth_band_pct of mid must be >= this multiple of order notional
@@ -80,7 +85,7 @@ class RugCheckCfg(BaseModel):
     min_liquidation_buffer_pct: float = Field(1.0, ge=0)  # beyond the stop, % of price
 
 
-class FeesCfg(BaseModel):
+class FeesCfg(Strict):
     spot_taker: float = Field(0.001, ge=0, le=0.01)
     spot_maker: float = Field(0.001, ge=0, le=0.01)
     futures_taker: float = Field(0.0005, ge=0, le=0.01)
@@ -89,7 +94,7 @@ class FeesCfg(BaseModel):
     paper_extra_slippage_bps: float = Field(2, ge=0, le=200)
 
 
-class StrategyCfg(BaseModel):
+class StrategyCfg(Strict):
     enabled: bool = True
     params: dict[str, float] = {}
 
@@ -104,7 +109,7 @@ def _default_strategies() -> dict[str, StrategyCfg]:
     }
 
 
-class ScannerCfg(BaseModel):
+class ScannerCfg(Strict):
     interval_seconds: int = Field(60, ge=10, le=3600)
     markets: list[Literal["spot", "futures"]] = ["spot", "futures"]
     spot_symbols: list[str] = DEFAULT_SYMBOLS
@@ -134,14 +139,14 @@ class ScannerCfg(BaseModel):
         return out
 
 
-class ScheduleCfg(BaseModel):
+class ScheduleCfg(Strict):
     enabled: bool = False
     days: list[int] = [0, 1, 2, 3, 4, 5, 6]  # Monday=0, UTC
     start_utc: str = "00:00"
     end_utc: str = "23:59"
 
 
-class AutomationCfg(BaseModel):
+class AutomationCfg(Strict):
     # Automated approval: if False, risk-approved trades wait for manual approval.
     auto_approve: bool = True
     enabled_agents: dict[str, bool] = {"scanner": True, "executor": True}

@@ -29,6 +29,7 @@ class RiskEngine:
                  vault: Vault, trade_clients):
         self.db, self.cfg, self.md, self.pf, self.state, self.vault = db, cfg, md, pf, state, vault
         self.trade_clients = trade_clients  # callable(mode, market) -> BinanceClient | None
+        self.balance_fn = None              # async callable(mode) -> exchange balances (set by engine)
         self.metrics = {"validated": 0, "approved": 0, "rejected": 0, "top_rejections": {}}
 
     # ---------------------------------------------------------- tokens
@@ -137,6 +138,20 @@ class RiskEngine:
             avail = D(s["futures"]["available"])
             add("margin_available", D(sizing["margin"]) <= avail,
                 f"margin {sizing['margin']:.2f}, available {avail:.2f} USDT")
+
+        if mode in ("testnet", "live") and self.balance_fn is not None:
+            # The configured ₹ budget is not an exchange deposit: verify real free balance too.
+            try:
+                bal = await self.balance_fn(mode)
+                if market == "spot":
+                    free = D((bal.get("spot") or {}).get("USDT", {}).get("free", "0"))
+                    need = D(sizing["notional"]) * D("1.002")
+                else:
+                    free = D((bal.get("futures") or {}).get("USDT", {}).get("available", "0"))
+                    need = D(sizing["margin"]) * D("1.05")
+                add("exchange_balance", free >= need, f"Binance {mode} {market} free {free:.2f} USDT, needs {need:.2f}")
+            except Exception as e:  # noqa: BLE001
+                add("exchange_balance", False, f"could not verify exchange balance: {e}")
 
         failed = [c for c in checks if not c["ok"]]
         self.metrics["validated"] += 1

@@ -191,3 +191,23 @@ async def test_market_data_outage_blocks_trading(engine, fake, monkeypatch):
     tid = await run_trade(engine, candidate("spot", "BTCUSDT"))
     assert engine.orch.trade(tid)["stage"] in ("REJECTED", "FAILED")
     assert engine.db.scalar("SELECT COUNT(*) FROM orders") == 0
+
+
+@pytest.mark.safety
+async def test_insufficient_real_exchange_balance_blocks(settings, fake):
+    e = await testnet_engine(settings, fake)
+    orig = fake.handler
+
+    def poor(request):
+        if request.url.path == "/api/v3/account":
+            import httpx
+            return httpx.Response(200, json={"canTrade": True, "balances": [{"asset": "USDT", "free": "1.0", "locked": "0"}]})
+        return orig(request)
+    import httpx
+    for c in (e.spot_data, e.futures_data, *[e.trade_client("testnet", m) for m in ("spot", "futures")]):
+        c._http._transport = httpx.MockTransport(poor)
+    tid = await run_trade(e, candidate("spot", "BTCUSDT"))
+    t = e.orch.trade(tid)
+    assert t["stage"] == "REJECTED" and "exchange_balance" in t["reject_reason"]
+    assert not [c for c in fake.calls if c[0] == "POST" and c[1] == "/api/v3/order"]
+    await e.close()

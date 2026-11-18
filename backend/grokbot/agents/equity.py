@@ -44,11 +44,12 @@ class EquityAgent(Agent):
             "profit_factor": None if c["profit_factor"] in (None, float("inf")) else round(c["profit_factor"], 2),
             "max_dd_pct": round(a["max_drawdown_pct"], 2), "trades": c["trades"],
         }
+        pnl = round(s["total_pnl"], 2) + 0.0  # avoid "-0.00"
         if reason != "periodic":
             self.log("equity_updated", f"Equity updated after {reason}: {s['total_equity']:.2f} USDT "
-                     f"(P&L {s['total_pnl']:+.2f})", data={"summary": {k: s[k] for k in (
+                     f"(P&L {pnl:+.2f})", data={"summary": {k: s[k] for k in (
                          "total_equity", "realized_pnl", "unrealized_pnl")}})
-        self.done(f"Equity {s['total_equity']:.2f} USDT ({s['total_pnl']:+.2f})", activity="Tracking portfolio")
+        self.done(f"Equity {s['total_equity']:.2f} USDT ({pnl:+.2f})", activity="Tracking portfolio")
         return s
 
     async def periodic(self, mode: str, every: float = 60.0) -> None:

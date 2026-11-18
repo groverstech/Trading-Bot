@@ -51,6 +51,8 @@ class Engine:
         self._trade_clients: dict[tuple[str, str], BinanceClient] = {}
         self._brokers: dict[str, object] = {"paper": PaperBroker(self.md, self.cfg)}
         self.risk = RiskEngine(self.db, self.cfg, self.md, self.pf, self.state, self.vault, self.trade_client)
+        self.risk.balance_fn = self._cached_balances
+        self._bal_cache: dict[str, tuple[float, dict]] = {}
         self.logger = LoggerAgent(self.db, self.bus, lambda: self.state.mode)
         self.scanner = ScannerAgent(self.logger, self.md, self.cfg)
         self.rugcheck = RugCheckAgent(self.logger, self.md, self.cfg)
@@ -95,6 +97,14 @@ class Engine:
             fut = FuturesAdapter(self.futures_data, self.trade_client(mode, "futures"))
             self._brokers[mode] = ExchangeBroker(mode, spot, fut, self.md)
         return self._brokers[mode]
+
+    async def _cached_balances(self, mode: str) -> dict:
+        hit = self._bal_cache.get(mode)
+        if hit and time.time() - hit[0] < 5:
+            return hit[1]
+        bal = await self.broker(mode).balances()
+        self._bal_cache[mode] = (time.time(), bal)
+        return bal
 
     def fingerprints(self) -> dict:
         return {m: self.vault.fingerprint(m, "live") for m in ("spot", "futures")}

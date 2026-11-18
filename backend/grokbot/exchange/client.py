@@ -125,7 +125,7 @@ class BinanceClient:
 
     async def request(self, method: str, path: str, params: dict | None = None, *,
                       signed: bool = False, weight: int = 1, retries: int | None = None,
-                      order: bool = False) -> dict | list:
+                      order: bool = False, api_key_only: bool = False) -> dict | list:
         params = {k: v for k, v in (params or {}).items() if v is not None}
         if retries is None:
             retries = 0 if (order or method != "GET") else 3
@@ -145,6 +145,10 @@ class BinanceClient:
                 headers["X-MBX-APIKEY"] = self._key
             else:
                 body = urlencode(params)
+                if api_key_only:  # e.g. listenKey endpoints: API key header, no signature
+                    if not self._key:
+                        raise BinanceError(0, None, "API key not configured", path)
+                    headers["X-MBX-APIKEY"] = self._key
             url = f"{path}?{body}" if body else path
             t0 = time.time()
             self.health.requests += 1

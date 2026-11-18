@@ -13,7 +13,7 @@ import time
 from collections import Counter
 
 from ..config_store import ConfigStore
-from ..market.data import MarketData
+from ..market.data import TF_SECONDS, MarketData
 from ..strategy import indicators as ind
 from ..strategy.strategies import evaluate
 from .base import Agent
@@ -23,9 +23,9 @@ class ScannerAgent(Agent):
     name = "scanner"
     title = "SCANNER"
 
-    def __init__(self, logger, md: MarketData, cfg: ConfigStore):
+    def __init__(self, logger, md: MarketData, cfg: ConfigStore, mode_fn=None):
         super().__init__(logger)
-        self.md, self.cfg = md, cfg
+        self.md, self.cfg, self.mode_fn = md, cfg, mode_fn
         self.metrics = {"cycles": 0, "signals": 0, "no_trade": 0, "markets_scanned": 0, "last_cycle_ms": 0}
         self.board: dict[str, dict] = {}   # per market:symbol summary for the watchlist
         self.no_trade_reasons: Counter = Counter()
@@ -33,14 +33,26 @@ class ScannerAgent(Agent):
 
     async def _scan_one(self, market: str, symbol: str, tf: str, sem: asyncio.Semaphore) -> list[dict]:
         sc = self.cfg.scanner
-        enabled = {n: s.params for n, s in self.cfg.strategies.items() if s.enabled}
+        enabled = self.tradable()
         async with sem:
             c = await self.md.klines(market, symbol, tf, 300)
             htf = {}
-            for ctf in sc.confirm_timeframes:
+            # Confirmation only from timeframes ABOVE the entry timeframe (mirrors research).
+            for ctf in [x for x in sc.confirm_timeframes if TF_SECONDS[x] > TF_SECONDS[tf]]:
                 hc = await self.md.klines(market, symbol, ctf, 250)
                 htf[ctf] = ind.trend_direction(hc.close)
         sigs, nots = evaluate(c, enabled, htf, allow_short=(market == "futures"))
+        mode = self.mode_fn() if self.mode_fn else "paper"
+        if not (mode == "paper" and self.cfg.automation.paper_research_mode):
+            kept = []
+            for sg in sigs:  # promoted strategies trade only where they were validated
+                pr = self.cfg.strategies[sg.strategy].promotion or {}
+                if tf in pr.get("timeframes", []) and market in pr.get("markets", []):
+                    kept.append(sg)
+                else:
+                    from ..strategy.strategies import NoTrade
+                    nots.append(NoTrade(sg.strategy, f"not validated for {market} {tf}"))
+            sigs = kept
         for n in nots:
             self.no_trade_reasons[f"{n.strategy}: {n.reason.split('(')[0].strip()}"] += 1
         self.metrics["no_trade"] += len(nots)
@@ -58,6 +70,16 @@ class ScannerAgent(Agent):
                         "candle_open": int(c.open_time[-1])})
         return out
 
+    def tradable(self) -> dict[str, dict]:
+        """Strategies allowed to generate trades in the current mode.
+
+        Testnet/live: enabled AND promoted by walk-forward validation.
+        Paper: the same, unless paper_research_mode is on, in which case
+        enabled-but-unpromoted strategies may forward-test on paper only."""
+        mode = self.mode_fn() if self.mode_fn else "paper"
+        research = mode == "paper" and self.cfg.automation.paper_research_mode
+        return {n: s.params for n, s in self.cfg.strategies.items() if s.enabled and (s.promoted or research)}
+
     async def scan(self) -> list[dict]:
         sc = self.cfg.scanner
         jobs = []
@@ -69,6 +91,11 @@ class ScannerAgent(Agent):
                     continue  # not listed on this market (or rules not loaded yet)
                 for tf in sc.timeframes:
                     jobs.append((market, sym, tf))
+        if not self.tradable():
+            self.done("No tradable strategies (none promoted)", activity="Idle: no promoted strategies")
+            self.log("scan_skipped", "No strategy is both enabled and promoted for this mode; nothing to scan",
+                     level="warning")
+            return []
         self.busy(f"Scanning {len(jobs)} market/timeframe combinations")
         t0 = time.time()
         results = await asyncio.gather(*(self._scan_one(m, s, tf, sem) for m, s, tf in jobs), return_exceptions=True)

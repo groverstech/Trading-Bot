@@ -22,6 +22,7 @@ export function Strategies({ toast }: { toast: (m: string, e?: boolean) => void 
   const save = async (name: string) => {
     try {
       await api.put("/api/config/strategies", { [name]: { enabled: draft[name].enabled, params: draft[name].params } });
+      // note: promotion can only be changed by walk-forward validation (python -m grokbot.research --apply)
       toast(`${name} saved (audited)`); load();
     } catch (e) { toast((e as Error).message, true); }
   };
@@ -35,9 +36,11 @@ export function Strategies({ toast }: { toast: (m: string, e?: boolean) => void 
 
   return (
     <>
+      <Research />
       <div className="grid-3" style={{ gridTemplateColumns: "repeat(5, minmax(0,1fr))" }}>
         {Object.entries(draft).map(([name, s]) => (
-          <Panel key={name} title={name} accent={s.enabled ? "var(--green)" : "var(--dim)"}
+          <Panel key={name} title={<>{name} <span className={(s as any).promoted ? "badge-promoted" : "badge-research"}>
+            {(s as any).promoted ? "· PROMOTED" : "· RESEARCH ONLY"}</span></>} accent={s.enabled ? "var(--green)" : "var(--dim)"}
             right={<label className="check"><input type="checkbox" checked={s.enabled}
               onChange={(e) => setDraft({ ...draft, [name]: { ...s, enabled: e.target.checked } })} />enabled</label>}>
             <div className="note" style={{ minHeight: 48 }}>{s.info}</div>
@@ -116,4 +119,46 @@ function BtChart({ results }: { results: BT[] }) {
     return () => c.remove();
   }, [results]);
   return <div ref={el} className="chart" style={{ height: 300 }} />;
+}
+
+
+type RRow = { strategy: string; timeframe: string; scenario: string; promote: boolean; positive_folds: string; positive_symbols: number;
+  breakeven_win_rate: number | null; checks: Record<string, boolean>;
+  oos: { trades: number; pf: number | null; expectancy_r: number | null; net_r: number; win_rate: number | null; max_dd_pct: number };
+  concentration?: { top_symbol: string; top_symbol_net_r: number; net_r_excluding_top: number } };
+
+function Research() {
+  const [d, setD] = useState<{ available: boolean; generated?: number; rows?: RRow[]; criteria?: Record<string, number>;
+    paper_research_mode?: boolean; how?: string } | null>(null);
+  const [scn, setScn] = useState("futures");
+  useEffect(() => { api.get<typeof d>("/api/research").then(setD).catch(() => {}); }, []);
+  if (!d) return null;
+  if (!d.available) return <Panel title="Walk-forward validation"><div className="note">No walk-forward results yet. Run <b>{d.how}</b>.</div></Panel>;
+  const rows = (d.rows ?? []).filter((r) => r.scenario === scn).sort((a, b) => (a.strategy + a.timeframe).localeCompare(b.strategy + b.timeframe));
+  const c = d.criteria!;
+  return (
+    <Panel title="Walk-forward validation · out-of-sample, after costs" accent="var(--yellow)" flush
+      right={<div className="seg">{["futures", "spot", "nocost"].map((x) => <button key={x} className={scn === x ? "active" : ""} onClick={() => setScn(x)}>{x}</button>)}</div>}>
+      <div className="note" style={{ padding: "8px 12px" }}>
+        Promotion requires: ≥{c.min_trades} OOS trades · PF ≥ {c.min_pf} · expectancy ≥ {c.min_expectancy_r}R · ≥{c.min_positive_fold_ratio * 100}% positive folds ·
+        ≥{c.min_positive_symbols}/5 positive symbols · max DD ≤ {c.max_drawdown_pct}%. Only promoted strategies can trade on testnet/live.
+        {d.paper_research_mode ? <span className="warn"> Paper research mode is ON: unpromoted strategies may forward-test in PAPER only.</span> : null}
+        {scn === "nocost" && <b className="warn"> Diagnostic scenario without fees: never promotable.</b>}
+      </div>
+      <div className="scroll"><table className="t research"><thead><tr><th>Strategy</th><th>TF</th><th className="r">Trades</th><th className="r">Win %</th>
+        <th className="r">Breakeven %</th><th className="r">PF</th><th className="r">Exp. R</th><th className="r">Net R</th><th className="r">Max DD</th>
+        <th className="r">+Folds</th><th className="r">+Symbols</th><th>Best symbol share</th><th>Failed checks</th><th>Verdict</th></tr></thead>
+        <tbody>{rows.map((r) => {
+          const failed = Object.entries(r.checks).filter(([, v]) => !v).map(([k]) => k);
+          return (<tr key={r.strategy + r.timeframe + r.scenario}>
+            <td>{r.strategy}</td><td>{r.timeframe}</td><td className="r">{r.oos.trades}</td><td className="r">{num(r.oos.win_rate, 1)}</td>
+            <td className="r muted">{num(r.breakeven_win_rate, 1)}</td><td className="r">{num(r.oos.pf)}</td>
+            <td className={`r ${pnlClass(r.oos.expectancy_r)}`}>{num(r.oos.expectancy_r, 3)}</td><td className={`r ${pnlClass(r.oos.net_r)}`}>{num(r.oos.net_r, 1)}</td>
+            <td className="r">{pct(r.oos.max_dd_pct, 1)}</td><td className="r">{r.positive_folds}</td><td className="r">{r.positive_symbols}/5</td>
+            <td className="muted">{r.concentration ? `${r.concentration.top_symbol.replace("USDT", "")} ${num(r.concentration.top_symbol_net_r, 1)}R (rest ${num(r.concentration.net_r_excluding_top, 1)}R)` : "—"}</td>
+            <td className="neg" style={{ whiteSpace: "normal", maxWidth: 260 }}>{failed.join(", ") || "—"}</td>
+            <td className={`promote ${r.promote && r.scenario !== "nocost" ? "pos" : "neg"}`}>{r.promote && r.scenario !== "nocost" ? "PROMOTE" : "REJECT"}</td></tr>);
+        })}</tbody></table></div>
+    </Panel>
+  );
 }

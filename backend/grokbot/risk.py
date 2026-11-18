@@ -20,7 +20,7 @@ from .security import Vault
 from .state import SystemState
 from .util import D
 
-IN_FLIGHT = ("RISK_APPROVED", "AWAITING_APPROVAL", "AWAITING_LIVE_CONFIRM", "EXECUTING")
+IN_FLIGHT = ("RISK_APPROVED", "AWAITING_APPROVAL", "AWAITING_LIVE_CONFIRM", "EXECUTING", "WORKING")
 TOKEN_TTL = 120
 
 
@@ -88,6 +88,11 @@ class RiskEngine:
             add("live_authorized", self.state.live_authorized(), self.state.live_auth.get("status"))
         ok, why = self.exchange_ok(mode, market)
         add("exchange_connectivity", ok, why)
+        if mode in ("testnet", "live"):
+            src = self.md.adapters[market].data.base_url
+            is_test = "testnet" in src
+            add("data_source_matches_mode", is_test == (mode == "testnet"),
+                f"{market} market data from {src} ({'testnet' if is_test else 'production'}) for {mode} orders")
         age = self.md.age(market, symbol)
         add("fresh_market_data", age <= r.stale_data_seconds, f"price age {age:.1f}s (max {r.stale_data_seconds}s)")
         sig_age = time.time() - trade["created_at"]

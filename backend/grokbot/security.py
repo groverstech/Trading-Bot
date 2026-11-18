@@ -109,27 +109,42 @@ class Vault:
 
 # -- operator authentication ---------------------------------------------------
 
-def hash_password(pw: str, salt: bytes | None = None) -> str:
+SCRYPT_N = 2**17  # OWASP-recommended minimum for scrypt (r=8, p=1): ~128 MiB
+
+
+def hash_password(pw: str, salt: bytes | None = None, n: int = SCRYPT_N) -> str:
     salt = salt or secrets.token_bytes(16)
-    h = hashlib.scrypt(pw.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
-    return "scrypt$" + base64.b64encode(salt).decode() + "$" + base64.b64encode(h).decode()
+    h = hashlib.scrypt(pw.encode(), salt=salt, n=n, r=8, p=1, dklen=32, maxmem=256 * 1024 * 1024)
+    return f"scrypt${n}$" + base64.b64encode(salt).decode() + "$" + base64.b64encode(h).decode()
 
 
 def check_password(pw: str, stored: str) -> bool:
+    parts = stored.split("$")
     try:
-        _, s, h = stored.split("$")
-        salt = base64.b64decode(s)
+        if len(parts) == 4:          # scrypt$N$salt$hash
+            n, salt = int(parts[1]), base64.b64decode(parts[2])
+            return hmac.compare_digest(hash_password(pw, salt, n), stored)
+        if len(parts) == 3:          # legacy scrypt$salt$hash (N=2^14)
+            salt = base64.b64decode(parts[1])
+            h = hashlib.scrypt(pw.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+            return hmac.compare_digest(base64.b64encode(h).decode(), parts[2])
     except ValueError:
         return False
-    return hmac.compare_digest(hash_password(pw, salt), stored)
+    return False
+
+
+def needs_rehash(stored: str) -> bool:
+    parts = stored.split("$")
+    return len(parts) != 4 or int(parts[1]) < SCRYPT_N
 
 
 class Auth:
     MIN_PASSWORD = 10
 
-    def __init__(self, db: Database, session_hours: int, env_password: str | None):
+    def __init__(self, db: Database, session_hours: int, env_password: str | None, idle_minutes: int = 120):
         self.db = db
         self.session_seconds = session_hours * 3600
+        self.idle_seconds = idle_minutes * 60
         if env_password and not self.is_configured():
             self.set_password(env_password)
 
@@ -144,7 +159,10 @@ class Auth:
 
     def verify_password(self, pw: str) -> bool:
         stored = self.db.meta_get("admin_password")
-        return bool(stored) and check_password(pw, stored)
+        ok = bool(stored) and check_password(pw, stored)
+        if ok and needs_rehash(stored):  # transparent upgrade of legacy hashes
+            self.db.meta_set("admin_password", hash_password(pw))
+        return ok
 
     def create_session(self) -> str:
         token = secrets.token_urlsafe(32)
@@ -159,7 +177,9 @@ class Auth:
         if not token:
             return False
         row = self.db.one("SELECT * FROM sessions WHERE token_hash=?", (self._h(token),))
-        if not row or row["expires_at"] < now():
+        if not row or row["expires_at"] < now() or now() - row["last_seen"] > self.idle_seconds:
+            if row:
+                self.db.execute("DELETE FROM sessions WHERE token_hash=?", (self._h(token),))
             return False
         self.db.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?", (now(), self._h(token)))
         return True

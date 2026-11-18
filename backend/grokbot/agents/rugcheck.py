@@ -105,7 +105,9 @@ class RugCheckAgent(Agent):
             # Liquidation risk at max allowed leverage (isolated, approx. 0.5% maintenance margin).
             lev = risk.max_leverage
             entry, stop = sig["entry"], sig["stop"]
-            liq = entry * (1 - 1 / lev + 0.005) if sig["direction"] == "LONG" else entry * (1 + 1 / lev - 0.005)
+            from .sizer import liquidation_price
+            from ..util import D as _D
+            liq = float(liquidation_price(_D(entry), lev, sig["direction"]))
             buffer = ((stop - liq) / entry * 100) if sig["direction"] == "LONG" else ((liq - stop) / entry * 100)
             add("liquidation_buffer", buffer >= rc.min_liquidation_buffer_pct, round(buffer, 2),
                 rc.min_liquidation_buffer_pct, f"distance stop→liquidation at {lev}x (% of price)")

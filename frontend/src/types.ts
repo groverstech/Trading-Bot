@@ -120,8 +120,17 @@ export interface Portfolio {
   inr: { total_equity: number | null; total_pnl: number | null };
 }
 
+export interface FeedStatus {
+  state: "LIVE" | "DELAYED" | "DISCONNECTED";
+  age: number | null;
+  source: "websocket" | "rest";
+  stream: { connected: boolean; messages: number; reconnects: number; lag_ms: number; last_error: string; streams: number; last_msg_age: number | null } | null;
+}
+
 export interface Snapshot {
   ts: number;
+  feed: { spot: FeedStatus; futures: FeedStatus; user_stream?: { connected: boolean; messages: number; last_error: string } };
+  working: (PipelineRow & { execution: { working_cid: string; price: string; placed_at: number; first_placed_at: number; reprices: number; target_qty: string } })[];
   system: {
     running: boolean;
     mode: Mode;

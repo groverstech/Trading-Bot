@@ -12,6 +12,8 @@ async def testnet_engine(settings, fake):
     for m in ("spot", "futures"):
         e.vault.store_credentials(m, "testnet", KEY, SECRET)
     e.reset_clients()
+    # testnet orders must be priced from testnet market data (risk check data_source_matches_mode)
+    e.spot_data.base_url, e.futures_data.base_url = "https://testnet.binance.vision", "https://testnet.binancefuture.com"
     e.state.set_mode("testnet", "test")
     e.pf.ensure_initialised("testnet")
     return e
@@ -210,4 +212,14 @@ async def test_insufficient_real_exchange_balance_blocks(settings, fake):
     t = e.orch.trade(tid)
     assert t["stage"] == "REJECTED" and "exchange_balance" in t["reject_reason"]
     assert not [c for c in fake.calls if c[0] == "POST" and c[1] == "/api/v3/order"]
+    await e.close()
+
+
+@pytest.mark.safety
+async def test_testnet_orders_blocked_on_production_data(settings, fake):
+    e = await testnet_engine(settings, fake)
+    e.spot_data.base_url = "https://data-api.binance.vision"
+    tid = await run_trade(e, candidate("spot", "BTCUSDT"))
+    t = e.orch.trade(tid)
+    assert t["stage"] == "REJECTED" and "data_source_matches_mode" in t["reject_reason"]
     await e.close()

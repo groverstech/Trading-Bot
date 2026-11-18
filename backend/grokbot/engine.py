@@ -38,7 +38,7 @@ class Engine:
         self.db = Database(s.db_path)
         self.cfg = ConfigStore(self.db)
         self.vault = Vault(self.db, s.data_dir, s.master_key_env)
-        self.auth = Auth(self.db, s.session_hours, s.admin_password_env)
+        self.auth = Auth(self.db, s.session_hours, s.admin_password_env, s.session_idle_minutes)
         self.state = SystemState(self.db, s.allow_live)
         self.bus = EventBus()
         self._transport = transport
@@ -47,6 +47,12 @@ class Engine:
         self.futures_data = BinanceClient(ep.futures_data, "futures", transport=transport)
         self.md = MarketData(SpotAdapter(self.spot_data), FuturesAdapter(self.futures_data), s.futures_data_is_testnet)
         self.fx = FxService(self.db, s.fx_url, transport=transport)
+        from .market.streams import MarketStreams
+        self.streams = MarketStreams(
+            self.md, ep.spot_ws, ep.futures_ws,
+            lambda: list(dict.fromkeys(self.cfg.scanner.timeframes + self.cfg.scanner.confirm_timeframes))) \
+            if s.enable_streams else None
+        self.user_stream = None
         self.pf = Portfolio(self.db, self.md, self.cfg, self.fx)
         self._trade_clients: dict[tuple[str, str], BinanceClient] = {}
         self._brokers: dict[str, object] = {"paper": PaperBroker(self.md, self.cfg)}
@@ -54,7 +60,7 @@ class Engine:
         self.risk.balance_fn = self._cached_balances
         self._bal_cache: dict[str, tuple[float, dict]] = {}
         self.logger = LoggerAgent(self.db, self.bus, lambda: self.state.mode)
-        self.scanner = ScannerAgent(self.logger, self.md, self.cfg)
+        self.scanner = ScannerAgent(self.logger, self.md, self.cfg, lambda: self.state.mode)
         self.rugcheck = RugCheckAgent(self.logger, self.md, self.cfg)
         self.sizer = SizerAgent(self.logger, self.md, self.cfg, self.pf)
         self.orch = Orchestrator(self)
@@ -62,6 +68,27 @@ class Engine:
                                       self.broker, self._on_change)
         self.equity = EquityAgent(self.logger, self.db, self.pf, self.risk, self.orch.on_breach)
         self.agents = [self.scanner, self.rugcheck, self.sizer, self.executor, self.logger, self.equity]
+        self._restore_agent_metrics()
+
+    def _restore_agent_metrics(self) -> None:
+        """Agent counters are rebuilt from the persistent audit trail so they
+        survive restarts (the trail is the source of truth)."""
+        cnt = {(r["agent"], r["event"]): r["n"] for r in self.db.all(
+            "SELECT agent, event, COUNT(*) n FROM agent_events GROUP BY agent, event")}
+        g = lambda a, e: int(cnt.get((a, e), 0))
+        self.scanner.metrics.update(cycles=g("scanner", "scan_cycle"), signals=g("scanner", "opportunity"))
+        self.rugcheck.metrics.update(approved=g("rugcheck", "approved"), rejected=g("rugcheck", "rejected"),
+                                     checked=g("rugcheck", "approved") + g("rugcheck", "rejected"))
+        self.sizer.metrics.update(sized=g("sizer", "sized"), rejected=g("sizer", "rejected"))
+        self.executor.metrics.update(orders=g("executor", "order_submitted"), filled=g("executor", "order_filled"),
+                                     closed=g("executor", "position_closed"), repriced=g("executor", "order_repriced"))
+        self.risk.metrics.update(approved=g("risk", "risk_approved"), rejected=g("risk", "risk_rejected"),
+                                 validated=g("risk", "risk_approved") + g("risk", "risk_rejected"))
+        for a in self.agents:
+            last = self.db.one("SELECT ts, message FROM agent_events WHERE agent=? ORDER BY id DESC LIMIT 1", (a.name,))
+            if last and a is not self.logger:
+                a.last_ts, a.last_decision = last["ts"], last["message"][:90]
+            a.ops = sum(v for (ag, _), v in cnt.items() if ag == a.name) if a is not self.logger else a.ops
 
     def _on_change(self, mode: str, reason: str) -> None:
         self.equity.update(mode, reason)

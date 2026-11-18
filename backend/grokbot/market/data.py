@@ -99,6 +99,8 @@ class MarketData:
         self._oi: dict[str, tuple[float, float]] = {}
         self.errors: dict[str, str] = {"spot": "", "futures": ""}
         self._rules_loaded_at = 0.0
+        self.streams = None  # MarketStreams, when enabled
+        self.rest_last: dict[str, float] = {"spot": 0.0, "futures": 0.0}
 
     def set_symbols(self, spot: list[str], futures: list[str]) -> None:
         self.symbols = {"spot": list(dict.fromkeys(spot)), "futures": list(dict.fromkeys(futures))}
@@ -171,9 +173,18 @@ class MarketData:
                     s not in self.rules[m] for m in self.rules for s in self.symbols[m]):
                 if time.time() - self._rules_loaded_at > 30:
                     await self.load_rules()
-            for m, coro in (("spot", self.refresh_spot()), ("futures", self.refresh_futures(n % 5 == 0))):
+            for m in ("spot", "futures"):
+                # With a healthy stream, REST only reconciles every 30 s;
+                # otherwise it is the primary feed (every interval).
+                live = self.streams is not None and self.streams.health[m].healthy(5.0)
+                if live and time.time() - self.rest_last[m] < 30:
+                    continue
                 try:
-                    await coro
+                    if m == "spot":
+                        await self.refresh_spot()
+                    else:
+                        await self.refresh_futures(n % 5 == 0 or live)
+                    self.rest_last[m] = time.time()
                 except Exception as e:  # noqa: BLE001
                     self.errors[m] = str(e)[:300]
                     log.warning("market refresh %s failed: %s", m, e)
@@ -222,6 +233,29 @@ class MarketData:
 
     async def depth(self, market: str, symbol: str, limit: int = 100) -> dict:
         return await self.adapters[market].depth(symbol, limit)
+
+    def on_closed_kline(self, market: str, symbol: str, tf: str, row: list) -> None:
+        """Append a closed candle delivered by the kline stream to the cache."""
+        key = (market, symbol, tf)
+        c = self._klines.get(key)
+        if c is None or not len(c):
+            return
+        ot = float(row[0])
+        if ot <= c.open_time[-1]:
+            return
+        if ot != c.open_time[-1] + TF_SECONDS[tf] * 1000:
+            self._klines.pop(key, None)  # gap: force a REST refetch
+            return
+        vals = [float(x) for x in row]
+        n = len(c)
+        arrs = [np.append(a, v)[-n:] for a, v in zip(
+            (c.open_time, c.open, c.high, c.low, c.close, c.volume, c.close_time, c.quote_volume), vals)]
+        self._klines[key] = Candles(symbol, tf, arrs[0], arrs[1], arrs[2], arrs[3], arrs[4], arrs[5], arrs[7],
+                                    arrs[6], time.time())
+
+    def book(self, market: str, symbol: str) -> dict | None:
+        """Streamed top-20 book if fresh, else None."""
+        return self.streams.book(market, symbol) if self.streams else None
 
     async def open_interest(self, symbol: str) -> float | None:
         """Open interest (contracts); cached 60 s."""

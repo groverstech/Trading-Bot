@@ -36,12 +36,22 @@ from .base import Agent
 MAINT_MARGIN_RATE = Decimal("0.005")  # conservative tier-1 approximation for liquidation estimate
 
 
-def liquidation_price(entry: Decimal, leverage: int, direction: str, mmr: Decimal = MAINT_MARGIN_RATE) -> Decimal:
-    """Approximate isolated-margin liquidation price (one-way mode, ignoring
-    maintenance amount offsets): long  = entry * (1 - 1/L + mmr)
-                                  short = entry * (1 + 1/L - mmr)"""
+def liquidation_price(entry: Decimal, leverage: int, direction: str, mmr: Decimal = MAINT_MARGIN_RATE,
+                      maint_amount: Decimal = Decimal(0)) -> Decimal:
+    """Isolated-margin liquidation price for a single one-way position, from
+    Binance's formula LP = (WB + cum - side*Q*EP) / (Q*MMR - side*Q) with the
+    isolated wallet balance WB = Q*EP/L (fees and accrued funding ignored):
+
+        long : LP = EP * (1 - 1/L) / (1 - MMR)      (+ cum/Q terms if cum > 0)
+        short: LP = EP * (1 + 1/L) / (1 + MMR)
+
+    MMR defaults to 0.5%, at or above Binance's lowest bracket for the default
+    pairs, which places the estimate slightly closer to entry (conservative).
+    Binance's own figure is authoritative."""
     inv = D(1) / D(leverage)
-    return entry * (1 - inv + mmr) if direction == "LONG" else entry * (1 + inv - mmr)
+    if direction == "LONG":
+        return (entry * (1 - inv) - maint_amount) / (1 - mmr) if maint_amount else entry * (1 - inv) / (1 - mmr)
+    return (entry * (1 + inv) + maint_amount) / (1 + mmr) if maint_amount else entry * (1 + inv) / (1 + mmr)
 
 
 class SizerAgent(Agent):

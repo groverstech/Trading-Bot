@@ -142,3 +142,34 @@ async def test_unknown_config_key_rejected(client):
     await login(client)
     r = await client.put("/api/config/risk", json={"max_leverag": 10}, headers=H)
     assert r.status_code == 400
+
+
+
+async def test_password_hash_upgrade_and_idle_timeout(engine):
+    import hashlib, base64
+    from grokbot.security import check_password, hash_password, needs_rehash
+    h = hash_password("abcdefghijk")
+    assert h.startswith("scrypt$131072$") and check_password("abcdefghijk", h) and not check_password("x" * 11, h)
+    salt = b"0" * 16
+    legacy = "scrypt$" + base64.b64encode(salt).decode() + "$" + base64.b64encode(
+        hashlib.scrypt(b"abcdefghijk", salt=salt, n=2**14, r=8, p=1, dklen=32)).decode()
+    assert check_password("abcdefghijk", legacy) and needs_rehash(legacy)
+    tok = engine.auth.create_session()
+    assert engine.auth.validate(tok)
+    engine.db.execute("UPDATE sessions SET last_seen=last_seen-99999")
+    assert not engine.auth.validate(tok)  # idle timeout
+
+
+@pytest.mark.safety
+async def test_websocket_rejects_foreign_origin(engine, settings):
+    from starlette.testclient import TestClient
+    app = create_app(settings, engine=engine, start_engine=False)
+    app.state.engine = engine
+    tok = engine.auth.create_session()
+    with TestClient(app) as c:
+        c.app.state.engine = engine
+        c.cookies.set("grok_session", tok)
+        from starlette.websockets import WebSocketDisconnect
+        with pytest.raises(WebSocketDisconnect):
+            with c.websocket_connect("/ws", headers={"origin": "https://evil.example"}) as ws:
+                ws.receive_text()

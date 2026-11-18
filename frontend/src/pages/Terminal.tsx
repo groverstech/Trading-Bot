@@ -2,13 +2,14 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { EquityChart, PriceChart } from "../components/charts";
 import {
-  ActivityLog, AgentCards, AllocationPanel, PendingOrders, Pipeline, PositionsTable, PerfStrip, RiskPanel, Watchlist,
+  ActivityLog, ActivityPanel, AgentCards, AllocationPanel, PendingOrders, Pipeline, PositionsTable, PerfStrip, RiskPanel,
+  Watchlist, WorkingOrders,
 } from "../components/panels";
 import { Panel } from "../components/ui";
 import { ago, clock, num, price } from "../fmt";
 import type { AgentEvent, Snapshot } from "../types";
 
-type Tab = "positions" | "pending" | "approval" | "recent" | "history" | "comms" | "incidents";
+type Tab = "positions" | "working" | "pending" | "approval" | "recent" | "history" | "comms" | "incidents";
 
 export function Terminal({ snap, events, openTrade, openAgent, toast }: {
   snap: Snapshot; events: AgentEvent[]; openTrade: (id: string) => void; openAgent: (a: string) => void;
@@ -36,7 +37,8 @@ export function Terminal({ snap, events, openTrade, openAgent, toast }: {
 
   const comms = events.filter((e) => e.event !== "scan_cycle" && e.event !== "equity_updated");
   const tabs: [Tab, string, number?][] = [
-    ["positions", "Live trading", modePositions.length], ["pending", "Pending orders", snap.pending_orders.length],
+    ["positions", "Live trading", modePositions.length], ["working", "Working limits", snap.working?.length ?? 0],
+    ["pending", "Pending orders", snap.pending_orders.length],
     ["approval", "Awaiting approval", snap.awaiting.length], ["recent", "Recent trades", snap.recent_trades.length],
     ["history", "Execution history"], ["comms", "Agent comms"], ["incidents", "Incidents", snap.incidents.length],
   ];
@@ -47,7 +49,7 @@ export function Terminal({ snap, events, openTrade, openAgent, toast }: {
       <PerfStrip s={snap} />
       <AgentCards agents={snap.agents} onOpen={openAgent} />
 
-      <div className="grid-main" style={{ height: 400 }}>
+      <div className="grid-main" style={{ height: 420 }}>
         <Panel title="Watchlist" flush right={<span className="dim mono nowrap" style={{ fontSize: 9.5 }}>
           S {snap.market.spot.age ?? "—"}s · P {snap.market.futures.age ?? "—"}s</span>}>
           <Watchlist rows={snap.watchlist} selected={sel} onSelect={setSel} />
@@ -58,7 +60,7 @@ export function Terminal({ snap, events, openTrade, openAgent, toast }: {
           <Pipeline rows={snap.pipeline} onOpen={openTrade} />
         </Panel>
         <Panel title="Activity log" flush accent="var(--green)" right={<span className="dim mono" style={{ fontSize: 9.5 }}>{events.length} events</span>}>
-          <ActivityLog events={events} onOpen={openTrade} />
+          <ActivityPanel events={events} onOpen={openTrade} />
         </Panel>
       </div>
 
@@ -78,6 +80,7 @@ export function Terminal({ snap, events, openTrade, openAgent, toast }: {
                 <div className="note" style={{ padding: "8px 12px" }}>Positions from other modes (still monitored and protected):</div>
                 <PositionsTable rows={otherPositions} onOpen={openTrade} toast={toast} /></>}
             </>}
+            {tab === "working" && <WorkingOrders rows={snap.working ?? []} onOpen={openTrade} />}
             {tab === "pending" && <PendingOrders rows={snap.pending_orders} />}
             {tab === "approval" && (snap.awaiting.length ? <Pipeline rows={snap.awaiting} onOpen={openTrade} /> :
               <div className="empty">{snap.system.auto_approve ? "Automated approval is on: risk-approved trades execute automatically." : "Nothing awaiting approval."}</div>)}

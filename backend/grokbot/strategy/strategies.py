@@ -49,35 +49,74 @@ def _f(x) -> float:
     return float(x) if x is not None and not math.isnan(x) else float("nan")
 
 
-@dataclass
 class Ctx:
-    """Shared, precomputed indicator values for one candle series."""
-    c: Candles
-    close: np.ndarray
-    atr: np.ndarray
-    ema20: np.ndarray
-    ema50: np.ndarray
-    ema200: np.ndarray
-    rsi: np.ndarray
-    macd_hist: np.ndarray
-    adx: np.ndarray
-    vwap: np.ndarray
-    vol_ma: np.ndarray
+    """Indicator context for evaluating strategies at one bar.
+
+    Indicators are computed ONCE over the full candle series (all are causal,
+    see test_indicators_are_causal_no_lookahead) and exposed as views ending
+    at ``end``. ``at(i)`` gives the context as it was when bar i closed,
+    sharing the cache, which makes walk-forward backtests fast and keeps them
+    free of look-ahead. Parameter-dependent series (e.g. RSI length) are
+    cached by key.
+    """
+
+    def __init__(self, c: Candles, end: int | None = None, cache: dict | None = None):
+        self.full = c
+        self.end = len(c) if end is None else end
+        self.cache = cache if cache is not None else {}
 
     @classmethod
     def build(cls, c: Candles) -> "Ctx":
-        _, _, hist = ind.macd(c.close)
-        return cls(c, c.close, ind.atr(c.high, c.low, c.close, 14), ind.ema(c.close, 20), ind.ema(c.close, 50),
-                   ind.ema(c.close, min(200, max(len(c) - 1, 1))), ind.rsi(c.close, 14), hist,
-                   ind.adx(c.high, c.low, c.close, 14),
-                   ind.vwap_session(c.open_time, c.high, c.low, c.close, c.volume), ind.sma(c.volume, 20))
+        return cls(c)
+
+    def at(self, i: int) -> "Ctx":
+        return Ctx(self.full, i + 1, self.cache)
+
+    def _series(self, key, fn) -> np.ndarray:
+        arr = self.cache.get(key)
+        if arr is None:
+            arr = self.cache[key] = fn(self.full)
+        return arr[: self.end]
+
+    @property
+    def c(self) -> Candles:
+        return self.full if self.end == len(self.full) else self.full.slice(self.end)
+
+    @property
+    def close(self): return self.full.close[: self.end]
+    @property
+    def atr(self): return self._series("atr14", lambda c: ind.atr(c.high, c.low, c.close, 14))
+    @property
+    def atr50(self): return self._series("atr50", lambda c: ind.atr(c.high, c.low, c.close, 50))
+    @property
+    def ema20(self): return self._series("ema20", lambda c: ind.ema(c.close, 20))
+    @property
+    def ema50(self): return self._series("ema50", lambda c: ind.ema(c.close, 50))
+    @property
+    def ema200(self): return self._series("ema200", lambda c: ind.ema(c.close, min(200, max(len(c) - 1, 1))))
+    @property
+    def rsi(self): return self.rsi_n(14)
+    @property
+    def macd_hist(self): return self._series("macd", lambda c: ind.macd(c.close)[2])
+    @property
+    def adx(self): return self._series("adx", lambda c: ind.adx(c.high, c.low, c.close, 14))
+    @property
+    def vwap(self): return self._series("vwap", lambda c: ind.vwap_session(c.open_time, c.high, c.low, c.close, c.volume))
+    @property
+    def vol_ma(self): return self._series("volma", lambda c: ind.sma(c.volume, 20))
+    @property
+    def bbw(self): return self._series("bbw", lambda c: ind.bb_width(c.close, 20))
+
+    def rsi_n(self, n: int):
+        return self._series(f"rsi{n}", lambda c: ind.rsi(c.close, n))
 
     def snapshot(self) -> dict:
         i = -1
+        vm = self.vol_ma
         return {"close": _f(self.close[i]), "atr": _f(self.atr[i]), "ema20": _f(self.ema20[i]),
                 "ema50": _f(self.ema50[i]), "ema200": _f(self.ema200[i]), "rsi": _f(self.rsi[i]),
                 "macd_hist": _f(self.macd_hist[i]), "adx": _f(self.adx[i]), "vwap": _f(self.vwap[i]),
-                "vol_ratio": _f(self.c.volume[i] / self.vol_ma[i]) if self.vol_ma[i] else float("nan")}
+                "vol_ratio": _f(self.full.volume[self.end - 1] / vm[i]) if vm[i] else float("nan")}
 
 
 def _bracket(name: str, direction: str, entry: float, atr: float, p: dict, score: float,
@@ -89,7 +128,8 @@ def _bracket(name: str, direction: str, entry: float, atr: float, p: dict, score
 
 
 def momentum(ctx: Ctx, p: dict) -> Signal | NoTrade:
-    r, r1, h, h1 = ctx.rsi[-1], ctx.rsi[-2], ctx.macd_hist[-1], ctx.macd_hist[-2]
+    rs = ctx.rsi_n(int(p.get("rsi_len", 14)))
+    r, r1, h, h1 = rs[-1], rs[-2], ctx.macd_hist[-1], ctx.macd_hist[-2]
     px, e50, a = ctx.close[-1], ctx.ema50[-1], ctx.atr[-1]
     if np.isnan([r, r1, h, h1, e50, a]).any():
         return NoTrade("momentum", "insufficient history")
@@ -170,12 +210,12 @@ def volatility(ctx: Ctx, p: dict) -> Signal | NoTrade:
     c = ctx.c
     if len(c) < 120:
         return NoTrade("volatility", "insufficient history")
-    bw = ind.bb_width(c.close, 20)
+    bw = ctx.bbw
     hist = bw[-101:-1]
     hist = hist[~np.isnan(hist)]
     if len(hist) < 50:
         return NoTrade("volatility", "insufficient history")
-    a14, a50 = ctx.atr[-1], ind.atr(c.high, c.low, c.close, 50)[-1]
+    a14, a50 = ctx.atr[-1], ctx.atr50[-1]
     pct = (hist < bw[-2]).mean() * 100  # squeeze percentile of the previous bar
     exp = a14 / a50 if a50 else 0
     need_sq, need_exp = p.get("squeeze_pct", 20), p.get("expansion", 1.3)

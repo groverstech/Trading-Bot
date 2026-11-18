@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS backtests (
 """
 
 
+# Additive column migrations: (table, column, definition)
+MIGRATIONS = [
+    ("positions", "protection", "TEXT"),
+    ("fills", "net_qty", "TEXT"),
+]
+
+
 class Database:
     def __init__(self, path: Path | str):
         self.path = str(path)
@@ -130,6 +137,10 @@ class Database:
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+            for table, col, ddl in MIGRATIONS:
+                cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+                if col not in cols:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:

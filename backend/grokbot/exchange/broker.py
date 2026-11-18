@@ -30,6 +30,14 @@ from .spot import SpotAdapter
 log = logging.getLogger("grokbot.broker")
 
 
+def loads_safe(s) -> dict:
+    import json
+    try:
+        return json.loads(s) if s else {}
+    except (TypeError, ValueError):
+        return {}
+
+
 @dataclass
 class ExecResult:
     status: str                    # FILLED | PARTIALLY_FILLED | REJECTED | NOT_FOUND | NEW | UNKNOWN
@@ -46,6 +54,11 @@ class ExecResult:
     @property
     def ok(self) -> bool:
         return self.status in ("FILLED", "PARTIALLY_FILLED") and self.filled_qty > 0
+
+    @property
+    def terminal(self) -> bool:
+        """No further fills can occur on this order."""
+        return self.status in ("FILLED", "CANCELED", "EXPIRED", "REJECTED", "NOT_FOUND", "EXPIRED_IN_MATCH")
 
     def slippage_usdt(self, side: str) -> Decimal:
         if self.ref_price <= 0 or self.filled_qty <= 0:
@@ -69,13 +82,17 @@ class PaperBroker:
 
     def __init__(self, md: MarketData, cfg: ConfigStore):
         self.md, self.cfg = md, cfg
+        self.orders: dict[str, dict] = {}
 
     async def prepare_futures(self, symbol: str, leverage: int, margin_mode: str) -> None:
         return None
 
     async def market_order(self, market: str, symbol: str, side: str, qty: Decimal, client_id: str,
                            reduce_only: bool = False) -> ExecResult:
-        book = await self.md.depth(market, symbol, 100)
+        book = self.md.book(market, symbol)
+        if book is None or walk_book(book["asks"] if side == "BUY" else book["bids"], qty) is None or \
+                walk_book(book["asks"] if side == "BUY" else book["bids"], qty)[1] < qty:
+            book = await self.md.depth(market, symbol, 100)
         levels = book["asks"] if side == "BUY" else book["bids"]
         if not book["bids"] or not book["asks"]:
             return ExecResult("REJECTED", error="empty order book")
@@ -97,8 +114,86 @@ class PaperBroker:
         return ExecResult(status, filled, avg, fee, mid, exchange_id=f"PAPER-{client_id}",
                           net_base_qty=filled, raw={"simulated": True, "book_levels": len(levels)})
 
+    # ---- simulated resting limit orders (in memory; fills are persisted by the Executor as they occur)
+    async def _book(self, market: str, symbol: str) -> dict:
+        return self.md.book(market, symbol) or await self.md.depth(market, symbol, 100)
+
+    async def limit_order(self, market: str, symbol: str, side: str, qty: Decimal, price: Decimal, client_id: str,
+                          post_only: bool = True) -> ExecResult:
+        if client_id in self.orders:
+            return ExecResult("REJECTED", error="duplicate client order id")
+        book = await self._book(market, symbol)
+        if not book["bids"] or not book["asks"]:
+            return ExecResult("REJECTED", error="empty order book")
+        best_bid, best_ask = D(book["bids"][0][0]), D(book["asks"][0][0])
+        marketable = price >= best_ask if side == "BUY" else price <= best_bid
+        mid = (best_bid + best_ask) / 2
+        o = {"market": market, "symbol": symbol, "side": side, "qty": qty, "price": price, "filled": ZERO,
+             "cost": ZERO, "fee": ZERO, "status": "NEW", "ts": time.time(), "ref": mid}
+        if marketable:
+            if post_only:
+                return ExecResult("EXPIRED", error="post-only order would immediately match (rejected as taker)",
+                                  ref_price=mid)
+            levels = book["asks"] if side == "BUY" else book["bids"]
+            take = [[p, q] for p, q in levels if (D(p) <= price if side == "BUY" else D(p) >= price)]
+            w = walk_book(take, qty)
+            if w:
+                avg, filled = w
+                rules = self.md.rules[market].get(symbol)
+                filled = rules.round_qty(filled, market_order=False) if rules else filled
+                fee_rate = D(self.cfg.fees.spot_taker if market == "spot" else self.cfg.fees.futures_taker)
+                o["filled"], o["cost"], o["fee"] = filled, filled * avg, filled * avg * fee_rate
+        o["status"] = "FILLED" if o["filled"] >= qty else ("PARTIALLY_FILLED" if o["filled"] > 0 else "NEW")
+        self.orders[client_id] = o
+        return self._result(client_id)
+
+    def _result(self, cid: str) -> ExecResult:
+        o = self.orders[cid]
+        avg = o["cost"] / o["filled"] if o["filled"] > 0 else ZERO
+        return ExecResult(o["status"], o["filled"], avg, o["fee"], o["ref"], exchange_id=f"PAPER-{cid}",
+                          net_base_qty=o["filled"], raw={"simulated": True, "limit": str(o["price"])})
+
+    async def poll_order(self, market: str, symbol: str, client_id: str) -> ExecResult:
+        """Advance a resting simulated order against the current book.
+
+        Conservative fill model: a resting BUY at P fills only when asks trade
+        THROUGH it (best ask < P); the filled quantity is capped by the ask
+        liquidity priced below P. Queue position is not modelled."""
+        o = self.orders.get(client_id)
+        if o is None:
+            return ExecResult("NOT_FOUND")
+        if o["status"] in ("NEW", "PARTIALLY_FILLED"):
+            book = await self._book(market, symbol)
+            side, price = o["side"], o["price"]
+            crossing = [q for p, q in (book["asks"] if side == "BUY" else book["bids"])
+                        if (D(p) < price if side == "BUY" else D(p) > price)]
+            avail = sum((D(q) for q in crossing), ZERO)
+            rem = o["qty"] - o["filled"]
+            take = min(rem, avail)
+            rules = self.md.rules[market].get(symbol)
+            if rules:
+                take = rules.round_qty(take, market_order=False)
+            if take > 0:
+                maker = D(self.cfg.fees.spot_maker if market == "spot" else self.cfg.fees.futures_maker)
+                o["filled"] += take
+                o["cost"] += take * price
+                o["fee"] += take * price * maker
+                o["status"] = "FILLED" if o["filled"] >= o["qty"] else "PARTIALLY_FILLED"
+        return self._result(client_id)
+
+    async def cancel_order(self, market: str, symbol: str, client_id: str) -> ExecResult:
+        o = self.orders.get(client_id)
+        if o is None:
+            return ExecResult("NOT_FOUND")
+        await self.poll_order(market, symbol, client_id)  # fills up to the cancel instant
+        if o["status"] in ("NEW", "PARTIALLY_FILLED"):
+            o["status"] = "CANCELED"
+        return self._result(client_id)
+
     async def query_order(self, market: str, symbol: str, client_id: str) -> ExecResult:
-        # Paper orders are written atomically with their fills; nothing to recover remotely.
+        if client_id in self.orders:
+            return self._result(client_id)
+        # Paper orders do not survive a restart; fills were persisted when they happened.
         return ExecResult("NOT_FOUND")
 
     async def place_protection(self, pos: dict) -> dict:
@@ -158,6 +253,44 @@ class ExchangeBroker:
         res.ref_price = ref
         return res
 
+    async def limit_order(self, market: str, symbol: str, side: str, qty: Decimal, price: Decimal, client_id: str,
+                          post_only: bool = True) -> ExecResult:
+        t = self.md.ticker(market, symbol)
+        ref = D((t.bid + t.ask) / 2) if t and t.bid and t.ask else ZERO
+        if market == "spot":
+            params = {"symbol": symbol, "side": side, "type": "LIMIT_MAKER" if post_only else "LIMIT",
+                      "quantity": fmt(qty), "price": fmt(price), "newClientOrderId": client_id}
+            if not post_only:
+                params["timeInForce"] = "GTC"
+        else:
+            params = {"symbol": symbol, "side": side, "type": "LIMIT", "timeInForce": "GTX" if post_only else "GTC",
+                      "quantity": fmt(qty), "price": fmt(price), "newClientOrderId": client_id}
+        try:
+            raw = await self._ad(market).new_order(**params)
+        except UnknownOrderState:
+            res = await self._reconcile(market, symbol, client_id)
+            res.ref_price = ref
+            return res
+        except BinanceError as e:
+            # Spot LIMIT_MAKER that would cross is rejected with -2010.
+            status = "EXPIRED" if (post_only and e.code == -2010 and "immediately match" in e.msg) else "REJECTED"
+            return ExecResult(status, error=f"{e.code}: {e.msg}", ref_price=ref)
+        res = await self._parse(market, symbol, raw)
+        res.ref_price = ref
+        return res
+
+    async def poll_order(self, market: str, symbol: str, client_id: str) -> ExecResult:
+        return await self.query_order(market, symbol, client_id)
+
+    async def cancel_order(self, market: str, symbol: str, client_id: str) -> ExecResult:
+        try:
+            await self._ad(market).cancel_order(symbol, client_id)
+        except BinanceError as e:
+            if e.code not in (-2011, -2013):  # unknown order: already final
+                return ExecResult("UNKNOWN", error=f"cancel failed: {e.code}: {e.msg}")
+        # The cancel response can race with fills: always re-query the final state.
+        return await self.query_order(market, symbol, client_id)
+
     async def _reconcile(self, market: str, symbol: str, client_id: str) -> ExecResult:
         for attempt in range(5):
             await asyncio.sleep(1 + attempt)
@@ -195,7 +328,7 @@ class ExchangeBroker:
             net = filled - base_fee
             if rules:
                 net = rules.round_qty(net, market_order=False)
-            if status == "EXPIRED" and filled > 0:
+            if status == "EXPIRED" and filled > 0 and raw.get("type") == "MARKET":
                 status = "PARTIALLY_FILLED"
             return ExecResult(status, filled, avg, fee, exchange_id=oid, net_base_qty=net, raw=raw)
         avg = D(raw.get("avgPrice", "0"))
@@ -208,7 +341,7 @@ class ExchangeBroker:
             if avg <= 0 and trades:
                 q = sum(D(tr["qty"]) for tr in trades)
                 avg = sum(D(tr["qty"]) * D(tr["price"]) for tr in trades) / q
-        if status == "EXPIRED" and filled > 0:
+        if status == "EXPIRED" and filled > 0 and raw.get("type") == "MARKET":
             status = "PARTIALLY_FILLED"
         return ExecResult(status, filled, avg, fee, exchange_id=oid, net_base_qty=filled,
                           realized_pnl=rpnl, raw=raw)
@@ -221,9 +354,12 @@ class ExchangeBroker:
         if market == "spot":
             qty = rules.round_qty(D(pos["qty"]), market_order=False)
             stop_limit = rules.floor_price(stop * D("0.995"))
+            prev = loads_safe(pos.get("protection"))
+            version = int(prev.get("version", 0)) + 1  # OCO resized after partial fills gets a new list id
+            lid = f"{cid}-P{version}"
             await self.spot.oco_sell(symbol, fmt(qty), fmt(rules.round_price(target)),
-                                     fmt(rules.round_price(stop)), fmt(stop_limit), f"{cid}-P")
-            return {"type": "spot-oco", "list_client_id": f"{cid}-P"}
+                                     fmt(rules.round_price(stop)), fmt(stop_limit), lid)
+            return {"type": "spot-oco", "list_client_id": lid, "version": version}
         close_side = "SELL" if pos["direction"] == "LONG" else "BUY"
         await self.futures.new_conditional(symbol, close_side, "STOP_MARKET", fmt(rules.round_price(stop)), f"{cid}-SL")
         await self.futures.new_conditional(symbol, close_side, "TAKE_PROFIT_MARKET",
@@ -234,7 +370,8 @@ class ExchangeBroker:
         cid = pos["trade_id"]
         try:
             if pos["market"] == "spot":
-                await self.spot.cancel_order_list(pos["symbol"], f"{cid}-P")
+                lid = loads_safe(pos.get("protection")).get("list_client_id", f"{cid}-P1")
+                await self.spot.cancel_order_list(pos["symbol"], lid)
             else:
                 for suffix in ("SL", "TP"):
                     try:
@@ -249,7 +386,8 @@ class ExchangeBroker:
         market, symbol = pos["market"], pos["symbol"]
         start_ms = int(pos["opened_at"] * 1000)
         if market == "spot":
-            lst = await self.spot.query_order_list(f"{pos['trade_id']}-P")
+            lid = loads_safe(pos.get("protection")).get("list_client_id", f"{pos['trade_id']}-P1")
+            lst = await self.spot.query_order_list(lid)
             if lst.get("listOrderStatus") != "ALL_DONE":
                 return ExitInfo(False)
             for o in lst.get("orders", []):

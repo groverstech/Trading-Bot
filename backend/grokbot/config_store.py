@@ -94,8 +94,22 @@ class FeesCfg(Strict):
     paper_extra_slippage_bps: float = Field(2, ge=0, le=200)
 
 
+class ExecutionCfg(Strict):
+    entry_order_type: Literal["market", "limit"] = "market"
+    post_only: bool = True                 # limit entries rest as maker (LIMIT_MAKER / GTX)
+    limit_offset_bps: float = Field(0, ge=0, le=50)   # distance behind best bid/ask
+    limit_expiry_seconds: int = Field(120, ge=10, le=3600)
+    reprice_after_seconds: int = Field(30, ge=5, le=3600)
+    max_reprices: int = Field(2, ge=0, le=10)
+    # Never reprice further than this from the signal's entry price.
+    max_chase_bps: float = Field(10, ge=0, le=100)
+
+
 class StrategyCfg(Strict):
     enabled: bool = True
+    # Set ONLY by walk-forward validation. Testnet/live trade promoted strategies only.
+    promoted: bool = False
+    promotion: dict = {}
     params: dict[str, float] = {}
 
 
@@ -149,6 +163,9 @@ class ScheduleCfg(Strict):
 class AutomationCfg(Strict):
     # Automated approval: if False, risk-approved trades wait for manual approval.
     auto_approve: bool = True
+    # Forward-test research: lets NON-promoted strategies trade in PAPER mode only.
+    # Has no effect in testnet or live, where only promoted strategies may trade.
+    paper_research_mode: bool = False
     enabled_agents: dict[str, bool] = {"scanner": True, "executor": True}
     schedule: ScheduleCfg = ScheduleCfg()
 
@@ -158,6 +175,7 @@ SECTIONS: dict[str, type[BaseModel]] = {
     "risk": RiskCfg,
     "rugcheck": RugCheckCfg,
     "fees": FeesCfg,
+    "execution": ExecutionCfg,
     "scanner": ScannerCfg,
     "automation": AutomationCfg,
 }
@@ -195,6 +213,8 @@ class ConfigStore:
     @property
     def scanner(self) -> ScannerCfg: return self._cache["scanner"]
     @property
+    def execution(self) -> ExecutionCfg: return self._cache["execution"]
+    @property
     def automation(self) -> AutomationCfg: return self._cache["automation"]
     @property
     def strategies(self) -> dict[str, StrategyCfg]: return self._cache["strategies"]
@@ -226,6 +246,8 @@ class ConfigStore:
             if name not in current:
                 raise KeyError(f"unknown strategy {name!r}")
             merged = current[name].model_dump()
+            if ("promoted" in val or "promotion" in val) and actor != "walk-forward":
+                raise ValueError("promotion status can only be set by walk-forward validation")
             merged.update({k: v for k, v in val.items() if k != "params"})
             merged["params"] = {**merged["params"], **val.get("params", {})}
             updated[name] = StrategyCfg.model_validate(merged)

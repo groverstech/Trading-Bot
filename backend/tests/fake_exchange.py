@@ -57,6 +57,7 @@ class FakeBinance:
         self.withdrawals_enabled = False
         self.hedge_mode = False
         self._oid = 1000
+        self.cancels: list[str] = []
 
     # ------------------------------------------------------------ helpers
     def _json(self, data, status=200):
@@ -167,11 +168,23 @@ class FakeBinance:
                     return self._json({"code": -2010, "msg": "Duplicate order sent."}, 400)
                 if cid in self.orders:
                     return self._json({"code": -2010, "msg": "Duplicate clientOrderId"}, 400)
+                if q["type"] in ("LIMIT", "LIMIT_MAKER"):
+                    r = self._place_limit(market, q, cid)
+                    if r.get("__error__"):
+                        return self._json({"code": -2010, "msg": "Order would immediately match and take."}, 400)
+                    return self._json(r)
                 o = self._fill(market, q["symbol"], q["side"], float(q["quantity"]), cid, q.get("reduceOnly") == "true")
                 if self.fail_next_order_timeout:
                     self.fail_next_order_timeout = False
                     raise httpx.ReadTimeout("simulated timeout after order accepted", request=request)
                 return self._json(o)
+            if request.method == "DELETE":
+                o = self.orders.get(cid)
+                if not o or o["status"] not in ("NEW", "PARTIALLY_FILLED"):
+                    return self._json({"code": -2011, "msg": "Unknown order sent."}, 400)
+                o["status"] = "CANCELED"
+                self.cancels.append(cid)
+                return self._json({k: v for k, v in o.items() if k != "fills"})
             if request.method == "GET":
                 if cid not in self.orders:
                     return self._json({"code": -2013, "msg": "Order does not exist."}, 400)
@@ -215,6 +228,40 @@ class FakeBinance:
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handler)
+
+    def _place_limit(self, market, q, cid):
+        sym, side, price, qty = q["symbol"], q["side"], float(q["price"]), float(q["quantity"])
+        p, sp = self.prices[sym], self.spread[sym]
+        bid, ask = p - sp / 2, p + sp / 2
+        crosses = price >= ask if side == "BUY" else price <= bid
+        post_only = q["type"] == "LIMIT_MAKER" or q.get("timeInForce") == "GTX"
+        self._oid += 1
+        o = {"symbol": sym, "orderId": self._oid, "clientOrderId": cid, "side": side, "type": "LIMIT",
+             "price": q["price"], "origQty": q["quantity"], "executedQty": "0", "cummulativeQuoteQty": "0",
+             "avgPrice": "0", "status": "NEW", "market": market}
+        if crosses and post_only:
+            if market == "spot":
+                return {"__error__": True}
+            o["status"] = "EXPIRED"
+        self.orders[cid] = o
+        return {k: v for k, v in o.items() if k != "market"}
+
+    def fill_resting(self, cid: str, qty: float):
+        """Fill a resting limit order (partially or fully) at its limit price."""
+        o = self.orders[cid]
+        market, sym, side = o["market"], o["symbol"], o["side"]
+        price = float(o["price"])
+        done = float(o["executedQty"]) + qty
+        o["executedQty"] = f"{done:.8f}"
+        o["cummulativeQuoteQty"] = f"{done * price:.8f}"
+        o["avgPrice"] = f"{price:.8f}"
+        o["status"] = "FILLED" if done >= float(o["origQty"]) - 1e-12 else "PARTIALLY_FILLED"
+        fee = qty * price * (0.001 if market == "spot" else 0.0002)
+        self.trades.append({"symbol": sym, "orderId": o["orderId"], "side": side, "qty": f"{qty:.8f}",
+                            "price": f"{price:.8f}", "commission": f"{fee:.8f}", "commissionAsset": "USDT",
+                            "realizedPnl": "0", "time": int(time.time() * 1000), "market": market})
+        if market == "futures":
+            self.positions[sym] = round(self.positions.get(sym, 0.0) + (qty if side == "BUY" else -qty), 8)
 
     # simulate protective stop trigger on futures
     def trigger_futures_stop(self, sym: str, cid_prefix: str):

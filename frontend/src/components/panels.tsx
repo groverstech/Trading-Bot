@@ -1,4 +1,4 @@
-import { useMemo, useRef } from "react";
+import { useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import { ago, clock, compact, num, pct, pnlClass, price, signed, spct, usdt } from "../fmt";
 import type { AgentCard, AgentEvent, PipelineRow, Position, Snapshot, StageState, Ticker } from "../types";
@@ -41,28 +41,61 @@ const AGENT_KPIS: Record<string, (m: Record<string, any>) => [string, string][]>
     ["MaxDD", m.max_dd_pct == null ? "—" : pct(m.max_dd_pct)]],
 };
 
+const ROLE: Record<string, string> = {
+  scanner: "finds opportunities", rugcheck: "filters unsafe markets", sizer: "sizes risk & margin",
+  executor: "places & manages orders", logger: "records every decision", equity: "tracks portfolio",
+};
+
+function ratio(a: AgentCard): [number | null, string] {
+  const m = a.metrics as Record<string, number>;
+  const r = (n: number, d: number) => (d > 0 ? n / d : null);
+  switch (a.name) {
+    case "scanner": return [r(m.signals ?? 0, (m.signals ?? 0) + (m.no_trade ?? 0)), "signal rate"];
+    case "rugcheck": return [r(m.approved ?? 0, m.checked ?? 0), "pass rate"];
+    case "sizer": return [r(m.sized ?? 0, (m.sized ?? 0) + (m.rejected ?? 0)), "accept rate"];
+    case "executor": return [r(m.filled ?? 0, m.orders ?? 0), "fill rate"];
+    case "equity": return [m.win_rate == null ? null : m.win_rate / 100, "win rate"];
+    default: return [null, "persisted"];
+  }
+}
+
+function decisionTone(d: string) {
+  if (/REJECT|FAIL|ERROR|refused/i.test(d)) return "neg";
+  if (/FILLED|APPROVED|CLOSED .*\+|^[A-Z]+ .* @ /.test(d)) return "pos";
+  if (/No trade|No tradable/i.test(d)) return "muted";
+  return "";
+}
+
 export function AgentCards({ agents, onOpen }: { agents: AgentCard[]; onOpen: (a: string) => void }) {
   return (
     <div className="agents">
-      {agents.map((a, i) => (
-        <div key={a.name} className={`agent ${a.name}`} onClick={() => onOpen(a.name)} title="Open agent activity & logs">
+      {agents.map((a, i) => {
+        const [rv, rl] = ratio(a);
+        return (
+        <div key={a.name} className={`agent ${a.name} st-${a.status}`} onClick={() => onOpen(a.name)} title={`${a.title}: ${ROLE[a.name]} · click for activity & logs`}>
           <div className="agent-top">
             <span><span className="agent-idx">0{i + 1}</span><span className="agent-name">{a.title}</span></span>
             <span className={`status ${a.status}`}><span className="dot" />{a.status}</span>
           </div>
+          <div className="agent-role">{ROLE[a.name]}</div>
           <div className="agent-act">{a.activity}</div>
-          <div className="agent-dec">Last: <b>{a.last_decision}</b></div>
+          <div className="agent-dec">Last: <b className={decisionTone(a.last_decision)}>{a.last_decision}</b></div>
           <div className="agent-foot">
             {AGENT_KPIS[a.name](a.metrics as Record<string, any>).map(([l, v]) => (
               <div key={l}><label>{l}</label><span>{v}</span></div>
             ))}
           </div>
-          <div className="row" style={{ marginTop: 6, justifyContent: "space-between" }}>
-            <span className="dim mono" style={{ fontSize: 9.5 }}>{a.ops.toLocaleString()} ops{a.errors ? ` · ${a.errors} err` : ""}</span>
+          <div className="agent-ratio" title={rl}>
+            <i style={{ width: rv == null ? "0%" : `${Math.round(rv * 100)}%` }} />
+          </div>
+          <div className="row" style={{ marginTop: 5, justifyContent: "space-between" }}>
+            <span className="dim mono" style={{ fontSize: 9.5 }}>{rl} {rv == null ? "—" : `${Math.round(rv * 100)}%`} · {a.ops.toLocaleString()} ops{a.errors ? ` · ${a.errors} err` : ""}</span>
             <span className="dim mono" style={{ fontSize: 9.5 }}>{ago(a.last_ts)}</span>
           </div>
+          {i < agents.length - 1 && <span className="flow" aria-hidden>›</span>}
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -120,7 +153,7 @@ export function PositionsTable({ rows, closed, onOpen, toast }: {
         <thead><tr>
           <th>Pair</th><th>Mkt</th><th>Dir</th><th className="r">Entry</th><th className="r">{closed ? "Exit" : "Price"}</th>
           <th className="r">Size</th><th className="r">Stop</th><th className="r">Target</th><th className="r">Lev</th>
-          <th className="r">Margin</th><th className="r">{closed ? "Net P&L" : "uP&L"}</th><th>{closed ? "Reason" : "Status"}</th><th />
+          <th className="r">Margin</th>{!closed && <th>SL ⟷ TP</th>}<th className="r">{closed ? "Net P&L" : "uP&L"}</th><th>{closed ? "Reason" : "Status"}</th><th />
         </tr></thead>
         <tbody>
           {rows.map((p) => {
@@ -135,6 +168,7 @@ export function PositionsTable({ rows, closed, onOpen, toast }: {
                 <td className="r neg">{price(p.stop)}</td><td className="r pos">{price(p.target)}</td>
                 <td className="r">{p.market === "futures" ? `${p.leverage}x` : "—"}</td>
                 <td className="r">{p.market === "futures" ? num(p.margin) : "—"}</td>
+                {!closed && <td><RangeBar p={p} /></td>}
                 <td className={`r ${pnlClass(v)}`}>{signed(v, 3)}{!closed && <span className="dim"> {spct(p.pnl_pct)}</span>}</td>
                 <td>{closed ? <span className="muted">{p.exit_reason?.replace(/_/g, " ")}</span> :
                   <span className={p.price_age > 15 ? "warn" : "pos"}>{p.status}{p.price_age > 15 ? " · stale" : ""}</span>}</td>
@@ -150,6 +184,60 @@ export function PositionsTable({ rows, closed, onOpen, toast }: {
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function RangeBar({ p }: { p: Position }) {
+  const span = p.target - p.stop;
+  const at = span ? (p.price - p.stop) / span : 0.5;
+  const ent = span ? (p.entry - p.stop) / span : 0.5;
+  const clamp = (x: number) => Math.min(1, Math.max(0, x)) * 100;
+  return (
+    <span className="rangebar" title={`stop ${price(p.stop)} · entry ${price(p.entry)} · now ${price(p.price)} · target ${price(p.target)}`}>
+      <i className="ent" style={{ left: `${clamp(ent)}%` }} />
+      <i className={`now ${at >= ent ? "up" : "dn"}`} style={{ left: `${clamp(at)}%` }} />
+    </span>
+  );
+}
+
+export function WorkingOrders({ rows, onOpen }: { rows: Snapshot["working"]; onOpen: (id: string) => void }) {
+  if (!rows.length) return <div className="empty">No working limit orders.</div>;
+  return (
+    <div className="scroll">
+      <table className="t"><thead><tr><th>Pair</th><th>Mkt</th><th>Dir</th><th className="r">Limit</th><th className="r">Signal entry</th>
+        <th className="r">Target qty</th><th className="r">Age</th><th className="r">Reprices</th><th>Client ID</th></tr></thead>
+        <tbody>{rows.map((w) => (
+          <tr key={w.id} className="click" onClick={() => onOpen(w.id)}>
+            <td><b>{w.symbol}</b></td><td><Mkt m={w.market} /></td><td><Dir d={w.direction} /></td>
+            <td className="r cyan">{price(Number(w.execution.price))}</td><td className="r">{price(w.entry)}</td>
+            <td className="r">{w.execution.target_qty}</td>
+            <td className="r">{Math.max(0, Math.round(Date.now() / 1000 - w.execution.first_placed_at))}s</td>
+            <td className="r">{w.execution.reprices}</td><td className="muted">{w.execution.working_cid}</td>
+          </tr>))}</tbody></table>
+    </div>
+  );
+}
+
+const FEED_AGENTS = ["scanner", "rugcheck", "sizer", "risk", "executor", "logger", "equity"];
+
+export function ActivityPanel({ events, onOpen }: { events: AgentEvent[]; onOpen: (id: string) => void }) {
+  const [only, setOnly] = useState<string | null>(null);
+  const [hideScan, setHideScan] = useState(true);
+  const [paused, setPaused] = useState<AgentEvent[] | null>(null);
+  const src = paused ?? events;
+  const list = src.filter((e) => (!only || e.agent === only) && (!hideScan || (e.event !== "scan_cycle" && e.event !== "equity_updated")));
+  return (
+    <div className="col" style={{ gap: 0, flex: 1, minHeight: 0 }}>
+      <div className="chips">
+        <button className={!only ? "on" : ""} onClick={() => setOnly(null)}>all</button>
+        {FEED_AGENTS.map((a) => (
+          <button key={a} className={only === a ? "on" : ""} style={{ color: AGENT_COLORS[a] }} onClick={() => setOnly(only === a ? null : a)}>{a}</button>))}
+        <span className="grow" />
+        <button className={hideScan ? "on" : ""} onClick={() => setHideScan(!hideScan)} title="hide routine scan-cycle / equity ticks">decisions only</button>
+        <button className={paused ? "on warn" : ""} onClick={() => setPaused(paused ? null : events)}>{paused ? "▶ resume" : "❚❚ pause"}</button>
+      </div>
+      <ActivityLog events={list} onOpen={onOpen} />
     </div>
   );
 }

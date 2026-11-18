@@ -6,6 +6,7 @@ import type { Snapshot } from "../types";
 
 type Cfg = Record<string, Record<string, any>>;
 const ENUMS: Record<string, string[]> = {
+  entry_order_type: ["market", "limit"],
   margin_mode: ["ISOLATED", "CROSSED"], emergency_policy: ["keep_protected", "flatten"],
 };
 const HELP: Record<string, string> = {
@@ -13,6 +14,10 @@ const HELP: Record<string, string> = {
   max_exposure_pct: "gross notional of open positions, % of that market's equity",
   max_correlated_exposure_pct: "notional of highly correlated positions, % of spot+futures equity",
   max_position_pct: "max single-position notional, % of that market's equity",
+  paper_research_mode: "lets UNPROMOTED strategies forward-test in PAPER only; never applies to testnet/live",
+  entry_order_type: "market: taker entry · limit: resting entry with expiry/repricing",
+  post_only: "limit entries never take liquidity (LIMIT_MAKER / GTX)",
+  max_chase_bps: "repricing never moves the limit further than this from the signal price",
   min_reward_risk: "minimum NET reward:risk after fees and slippage",
   emergency_policy: "keep_protected: leave SL/TP active · flatten: close at market only if exchange reachable",
   stale_data_seconds: "block trading when prices are older than this",
@@ -139,9 +144,9 @@ export function Settings({ snap, toast }: { snap: Snapshot; toast: (m: string, e
               }}>{m}</button>))}
             <span className="note">LIVE can only be entered via the Live activation workflow. Stop the system to change mode.</span>
           </div>
-          <ConfigForm section="automation" value={{ auto_approve: cfg.automation.auto_approve, ...Object.fromEntries(
+          <ConfigForm section="automation" value={{ auto_approve: cfg.automation.auto_approve, paper_research_mode: cfg.automation.paper_research_mode, ...Object.fromEntries(
             Object.entries(cfg.automation.enabled_agents).map(([k, v]) => [`agent_${k}`, v])) }}
-            onSaved={load} toast={toast} toPatch={(all) => ({ auto_approve: all.auto_approve, enabled_agents: Object.fromEntries(
+            onSaved={load} toast={toast} toPatch={(all) => ({ auto_approve: all.auto_approve, paper_research_mode: all.paper_research_mode, enabled_agents: Object.fromEntries(
               Object.entries(all).filter(([k]) => k.startsWith("agent_")).map(([k, v]) => [k.slice(6), v])) })} />
           <div className="note" style={{ marginTop: 8 }}>agent_scanner / agent_executor disable automatic scanning / execution. With auto approve off, risk-approved trades wait in “Awaiting approval”.</div>
           <h4 className="mono muted" style={{ margin: "14px 0 8px", fontSize: 10, letterSpacing: ".14em" }}>TRADING SCHEDULE (UTC)</h4>
@@ -156,6 +161,12 @@ export function Settings({ snap, toast }: { snap: Snapshot; toast: (m: string, e
           </div>
         </Panel>
       </div>
+
+      <Panel title="Execution · entry orders" accent="var(--green)">
+        <ConfigForm section="execution" value={cfg.execution} onSaved={load} toast={toast} />
+        <div className="note" style={{ marginTop: 8 }}>Limit entries rest as post-only maker orders at the best bid/ask; fills are applied incrementally and
+          stop-loss/take-profit always cover the filled quantity. Unfilled orders expire; repricing never chases beyond max_chase_bps from the signal price.</div>
+      </Panel>
 
       <Panel title="Risk management" accent="var(--red)">
         <ConfigForm section="risk" value={cfg.risk} onSaved={load} toast={toast} />

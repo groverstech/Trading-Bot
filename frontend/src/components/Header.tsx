@@ -5,7 +5,17 @@ import type { Snapshot } from "../types";
 import { ConfirmModal } from "./ui";
 
 export type Page = "terminal" | "analytics" | "strategies" | "logs" | "settings" | "live";
-const PAGES: Page[] = ["terminal", "analytics", "strategies", "logs", "settings", "live"];
+const PAGES: [Page, string][] = [["terminal", "◧"], ["analytics", "◔"], ["strategies", "⚙"], ["logs", "☰"], ["settings", "⛭"], ["live", "⚠"]];
+
+function FeedBadge({ label, f }: { label: string; f?: Snapshot["feed"]["spot"] }) {
+  const st = f?.state ?? "DISCONNECTED";
+  const title = f ? `${label}: ${st} via ${f.source}${f.stream ? ` · ${f.stream.messages.toLocaleString()} msgs · lag ${Math.round(f.stream.lag_ms)} ms · ${f.stream.reconnects} reconnects` : ""}${f.age != null ? ` · last update ${f.age}s ago` : ""}` : label;
+  return (
+    <span className={`feed ${st.toLowerCase()}`} title={title}>
+      <span className="dot" />{label}<b>{st}</b>
+    </span>
+  );
+}
 
 export function Header({ snap, page, setPage, connected, toast }: {
   snap: Snapshot | null; page: Page; setPage: (p: Page) => void; connected: boolean; toast: (m: string, e?: boolean) => void;
@@ -33,8 +43,10 @@ export function Header({ snap, page, setPage, connected, toast }: {
         <div><h1>GROK BOT TERMINAL</h1><small>6-AGENT AUTONOMOUS · BINANCE</small></div>
       </div>
       <nav className="nav">
-        {PAGES.map((x) => (
-          <button key={x} className={page === x ? "active" : ""} onClick={() => setPage(x)}>{x}</button>
+        {PAGES.map(([x, icon]) => (
+          <button key={x} className={page === x ? "active" : ""} onClick={() => setPage(x)}>
+            <span className="nav-i">{icon}</span><span className="nav-t">{x}</span>
+          </button>
         ))}
       </nav>
       <span className="grow" />
@@ -45,20 +57,23 @@ export function Header({ snap, page, setPage, connected, toast }: {
         {mode === "live" ? "● LIVE · REAL MONEY" : mode === "testnet" ? "TESTNET" : "PAPER"}
       </span>
       <div className="hsep" />
-      <div className="hstat"><label>Session</label><b>{duration(sessionSecs)}</b></div>
+      <div className="hstat hide-sm"><label>Session</label><b>{duration(sessionSecs)}</b></div>
       <div className="hstat"><label>Equity</label>
         <b>{num(p?.total_equity)} <span className="dim" style={{ fontSize: 10 }}>USDT</span></b></div>
-      <div className="hstat"><label>≈ INR</label><b>{inr(p?.inr.total_equity)}</b></div>
-      <div className="hstat"><label>Trades</label><b>{sys?.total_trades ?? "—"}</b></div>
-      <div className="hstat"><label>Feed</label>
-        <b className={connected ? "pos" : "neg"} style={{ fontSize: 11 }}>{connected ? "● ONLINE" : "○ OFFLINE"}</b></div>
+      <div className="hstat hide-sm"><label>≈ INR</label><b>{inr(p?.inr.total_equity)}</b></div>
+      <div className="hstat hide-sm"><label>Trades</label><b>{sys?.total_trades ?? "—"}</b></div>
+      <div className="hstat feeds"><label>Market data {connected ? "" : "· UI OFFLINE"}</label>
+        <span className="row" style={{ gap: 4 }}>
+          <FeedBadge label="SPOT" f={connected ? snap?.feed?.spot : undefined} />
+          <FeedBadge label="PERP" f={connected ? snap?.feed?.futures : undefined} />
+        </span></div>
       <div className="hsep" />
       {sys?.running ? (
         <button className="btn" onClick={() => run("/api/system/stop", "System stopped: no new scans")}>Stop</button>
       ) : (
         <button className="btn go" disabled={!!halted} onClick={() => run("/api/system/start", "System started")}>Start</button>
       )}
-      <button className="estop" onClick={() => setEstop(true)}>⏻ EMERGENCY STOP</button>
+      <button className="estop" onClick={() => setEstop(true)} title="Emergency stop"><span>⏻</span><span className="estop-t"> EMERGENCY STOP</span></button>
       {estop && (
         <ConfirmModal danger title="EMERGENCY STOP" confirmLabel="Halt trading now"
           body={<>Immediately halts all new trading, cancels pending entries and applies the configured emergency

@@ -82,6 +82,8 @@ class Orchestrator:
             c.state.incident("startup_recovery", "info", {"notes": notes})
         self.tasks = [
             asyncio.create_task(c.md.run(self.stop_event), name="market-data"),
+            *([asyncio.create_task(c.streams.run(self.stop_event), name="streams")] if c.streams else []),
+            asyncio.create_task(self._user_stream_loop(), name="user-stream"),
             asyncio.create_task(self._fx_loop(), name="fx"),
             asyncio.create_task(self._scanner_loop(), name="scanner"),
             asyncio.create_task(self._monitor_loop(), name="monitor"),
@@ -100,6 +102,41 @@ class Orchestrator:
         done, pending = await asyncio.wait(waits, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
         for p in pending:
             p.cancel()
+
+    async def _user_stream_loop(self) -> None:
+        """Run the futures user-data stream whenever the active mode is an
+        exchange mode with futures credentials; restart it on change."""
+        from .market.streams import FuturesUserStream
+        c = self.c
+        current: tuple | None = None
+        task: asyncio.Task | None = None
+        stop = asyncio.Event()
+        while not self.stop_event.is_set():
+            mode = c.state.mode
+            client = c.trade_client(mode, "futures") if mode in ("testnet", "live") else None
+            want = (mode, id(client)) if client else None
+            if want != current:
+                if task:
+                    stop.set()
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    task, c.user_stream = None, None
+                if want:
+                    stop = asyncio.Event()
+                    base = c.settings.endpoints.futures_ws_testnet if mode == "testnet" else c.settings.endpoints.futures_ws
+                    c.user_stream = FuturesUserStream(client, base, self._on_user_event)
+                    task = asyncio.create_task(c.user_stream.run(stop))
+                current = want
+            await self._sleep(10)
+        if task:
+            stop.set()
+            task.cancel()
+
+    def _on_user_event(self, ev: dict) -> None:
+        if ev.get("e") in ("ORDER_TRADE_UPDATE", "ACCOUNT_UPDATE", "ALGO_UPDATE"):
+            self.c.executor.nudge()
+            self.c.logger.record("executor", "user_stream", f"Exchange event {ev.get('e')} received; reconciling via REST",
+                                 None, {"e": ev.get("e")}, "info")
 
     async def _fx_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -326,6 +363,9 @@ class Orchestrator:
         n = c.db.execute(
             f"UPDATE trades SET stage='CANCELLED', status='cancelled', updated_at=?, reject_reason=? "
             f"WHERE stage IN ({','.join('?' * len(PRE_EXEC))})", (now(), f"halt: {kind}", *PRE_EXEC)).rowcount
+        for w in c.db.all("SELECT id FROM trades WHERE stage='WORKING'"):
+            await c.executor.cancel_working(c.executor._trade(w["id"]), "cancelled by halt")
+            n += 1
         policy = c.cfg.risk.emergency_policy
         actions = []
         for pos in c.db.all("SELECT * FROM positions WHERE status='OPEN'"):

@@ -41,7 +41,7 @@ def pipeline_row(t: dict) -> dict:
         "sizer": "rejected" if sz and not sz.get("approved") else ("approved" if sz and sz.get("approved") else "pending"),
         "risk": "rejected" if rk and not rk.get("approved") else ("approved" if rk and rk.get("approved") else "pending"),
         "executor": "failed" if failed_exec else ("approved" if idx >= order.index("OPEN") else
-                                                  "working" if stage == "EXECUTING" else
+                                                  "working" if stage in ("EXECUTING", "WORKING") else
                                                   "waiting" if stage.startswith("AWAITING") else "pending"),
     }
     stages["logger"] = "approved"
@@ -106,8 +106,15 @@ def build(e) -> dict:
                           "vol_ratio": b.get("vol_ratio"), "signals": b.get("signals", [])})
     tc = {f"{env}:{m}": (lambda c: c.health.as_dict() if c else None)(e.trade_client(env, m))
           for env in ("testnet", "live") for m in ("spot", "futures")} if mode != "paper" else {}
+    from ..market.streams import status_for
+    feed = {m: status_for(e.md, m, e.cfg.risk.stale_data_seconds) for m in ("spot", "futures")}
+    if e.user_stream:
+        feed["user_stream"] = e.user_stream.health.as_dict()
+    working = db.all("SELECT * FROM trades WHERE stage='WORKING' ORDER BY created_at DESC")
     return _clean({
         "ts": time.time(),
+        "feed": feed,
+        "working": [pipeline_row(t) | {"execution": loads(t["execution"])} for t in working],
         "system": {
             "running": e.state.running, "mode": mode, "halt": e.state.halt, "started_at": e.state.started_at,
             "session_started": e.state.session_started, "live_auth": {k: v for k, v in e.state.live_auth.items()

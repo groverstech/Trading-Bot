@@ -23,3 +23,18 @@ The LINK short in Part A lost 0.768 USDT against 0.40 USDT of planned risk.
 Regression tests replay the case. Details: `AUDIT.md` F11.
 
 Trades opened after the fix (XRP, and all of Part B) show entry drift of at most 0.1%.
+
+## Outcome summary
+
+* **Part A** (1.7 h):
+  * 5 positions opened: 2 by market order, 3 by limit/post-only order, one of which filled at the maker fee with price improvement.
+  * 2 closed at their stop-loss: LINK (pre-fix drift case) and XRP (−0.358 USDT vs 0.40 planned).
+  * 3 still open at the end of the session, under live management.
+  * Risk rejected trades on max positions (3) and duplicates; Rug Check rejected on spread.
+  * Independent audit: all checks pass.
+* **Part B:**
+  * Round 1: the BTC spot long and ETH futures short both exited at their **stop-loss**. The ETH stop triggered on the testnet mark price and filled below the stop level because of a gap between the testnet mark and its book (AUDIT F10).
+  * Round 2: the futures BTC short was rejected by the **Sizer** (net R:R 1.43 < 1.5) and the futures ETH long by **Rug Check** (spread and order-book imbalance on the testnet book). The validation trades got no exemption.
+  * The round-2 BTC long was still open when the 60-minute run ended.
+* **A take-profit exit did not occur on live prices during this session.** The take-profit path is exercised by the automated tests: `test_spot_trade_full_lifecycle`, `test_independent_audit_after_full_lifecycles`, and the exchange-side OCO/algo placement tests.
+* A Futures WebSocket disconnect (`no close frame received`) occurred and the stream reconnected automatically.

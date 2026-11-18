@@ -38,9 +38,9 @@ def render(db: Database, mode: str = "paper") -> str:
          f"* Capital: ₹{cap.get('starting_inr', 0):,} at USD/INR {cap.get('usd_inr')} = {float(cap.get('starting_usdt', 0)):.4f} USDT",
          f"* Market data: Spot production (data-api.binance.vision + data-stream WebSocket); Futures prices from the "
          "Binance Futures TESTNET feed (production futures endpoints are geo-blocked in this environment).",
-         f"* Process starts: {(n_starts := sum(1 for e in ev if e['event'] == 'equity_updated' and 'startup' in e['message']))}"
-         f" (initial start + {max(0, n_starts - 1)} restart(s) with open positions; positions and orders persisted, "
-         "the system came back STOPPED each time, and no order was resubmitted).", ""]
+         *([f"* Process starts: {n_starts} (initial start + {n_starts - 1} restart(s) with open positions; positions and "
+            "orders persisted, the system came back STOPPED each time, and no order was resubmitted)."]
+           if (n_starts := sum(1 for e in ev if e['event'] == 'equity_updated' and 'startup' in e['message'])) else []), ""]
     cnt = Counter(e["event"] for e in ev)
     stages = Counter(t["stage"] for t in trades)
     L += ["## Pipeline funnel", "",

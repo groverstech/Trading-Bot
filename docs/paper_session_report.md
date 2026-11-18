@@ -24,34 +24,51 @@ Regression tests replay the case. Details: `AUDIT.md` F11.
 
 Trades opened after the fix (XRP, and all of Part B) show entry drift of at most 0.1%.
 
+## Outcome summary
+
+* **Part A** (1.7 h):
+  * 5 positions opened: 2 by market order, 3 by limit/post-only order, one of which filled at the maker fee with price improvement.
+  * 2 closed at their stop-loss: LINK (pre-fix drift case) and XRP (−0.358 USDT vs 0.40 planned).
+  * 3 still open at the end of the session, under live management.
+  * Risk rejected trades on max positions (3) and duplicates; Rug Check rejected on spread.
+  * Independent audit: all checks pass.
+* **Part B:**
+  * Round 1: the BTC spot long and ETH futures short both exited at their **stop-loss**. The ETH stop triggered on the testnet mark price and filled below the stop level because of a gap between the testnet mark and its book (AUDIT F10).
+  * Round 2: the futures BTC short was rejected by the **Sizer** (net R:R 1.43 < 1.5) and the futures ETH long by **Rug Check** (spread and order-book imbalance on the testnet book). The validation trades got no exemption.
+  * The round-2 BTC long was still open when the 60-minute run ended.
+* **A take-profit exit did not occur on live prices during this session.** The take-profit path is exercised by the automated tests: `test_spot_trade_full_lifecycle`, `test_independent_audit_after_full_lifecycles`, and the exchange-side OCO/algo placement tests.
+* A Futures WebSocket disconnect (`no close frame received`) occurred and the stream reconnected automatically.
+
 
 ---
 
 # Part A: strategy forward-test (paper research mode)
 
-Generated 2026-11-18 17:13:39 UTC from the session database. Mode: **PAPER** (simulated fills on genuine Binance market data; not real performance).
+Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (simulated fills on genuine Binance market data; not real performance).
 
-* Session window: 2026-11-18 16:41:45 → 2026-11-18 17:13:21 UTC (0.53 h of recorded activity)
+* Session window: 2026-11-18 16:41:45 → 2026-11-18 18:24:21 UTC (1.71 h of recorded activity)
 * Capital: ₹50,000 at USD/INR 93.513494 = 534.6822 USDT
 * Market data: Spot production (data-api.binance.vision + data-stream WebSocket); Futures prices from the Binance Futures TESTNET feed (production futures endpoints are geo-blocked in this environment).
 * Process starts: 4 (initial start + 3 restart(s) with open positions; positions and orders persisted, the system came back STOPPED each time, and no order was resubmitted).
 
 ## Pipeline funnel
 
-* Scan cycles: 33 · opportunities detected: 7
-* Rug Check: 6 approved / 1 rejected
-* Sizer: 6 sized / 0 rejected
-* Risk: 3 approved / 3 rejected
-* Executor: 3 orders submitted · 3 fills · 1 positions closed · 0 reprices · 0 limit entries expired unfilled
-* Final opportunity stages: REJECTED 4, OPEN 2, CLOSED 1
+* Scan cycles: 104 · opportunities detected: 13
+* Rug Check: 12 approved / 1 rejected
+* Sizer: 11 sized / 1 rejected
+* Risk: 6 approved / 5 rejected
+* Executor: 6 orders submitted · 6 fills · 2 positions closed · 4 reprices · 1 limit entries expired unfilled
+* Final opportunity stages: REJECTED 7, OPEN 3, CLOSED 2, EXPIRED 1
 
 ### Why opportunities were not traded
 
 | Reason | Count |
 |---|---:|
-| risk: max_positions | 2 |
+| risk: max_positions | 3 |
+| risk: no_duplicate | 2 |
 | rugcheck: spread | 1 |
-| risk: no_duplicate | 1 |
+| sizer: notional 25.2272 below minimum 50 | 1 |
+| limit entry expired unfilled:  | 1 |
 
 ## Trades
 
@@ -113,17 +130,21 @@ Generated 2026-11-18 17:13:39 UTC from the session database. Mode: **PAPER** (si
 
 </details>
 
-### XRPUSDT futures SHORT · momentum · `GB1A1EF9A51D31CDD9B` · OPEN
+### XRPUSDT futures SHORT · momentum · `GB1A1EF9A51D31CDD9B` · CLOSED
 
 * Planned: entry 0.9692, stop 0.9846495466161831, target 0.9383009067676337; qty 23.9, risk 0.3982 USDT (0.250% of futures equity), 1x, net R:R 1.78
+* Result: exit stop_loss @ 0.984397; gross -0.341694, fees 0.016401, funding +0.000000, slippage 0.004704 → **realized -0.358095 USDT**
 
 | Fill time (UTC) | Order | Purpose | Qty | Price | Ref (mid) | Fee USDT | Slippage USDT |
 |---|---|---|---:|---:|---:|---:|---:|
 | 2026-11-18 17:00:52 | GB1A1EF9A51D31CDD9B-E (LIMIT) | entry | 23.9 | 0.9701 | 0.97005 | 0.004637 | -0.001195 |
+| 2026-11-18 17:28:58 | GB1A1EF9A51D31CDD9B-X (MARKET) | exit | 23.9 | 0.984397 | 0.98415 | 0.011764 | 0.005899 |
 
 | Ledger (UTC) | Account | Kind | Amount | Note |
 |---|---|---|---:|---|
 | 2026-11-18 17:00:52 | futures | fee | -0.004637 | entry fee |
+| 2026-11-18 17:28:58 | futures | pnl | -0.341694 | close XRPUSDT (stop_loss) |
+| 2026-11-18 17:28:58 | futures | fee | -0.011764 | exit fee |
 
 <details><summary>Agent trail</summary>
 
@@ -137,17 +158,79 @@ Generated 2026-11-18 17:13:39 UTC from the session database. Mode: **PAPER** (si
 | 2026-11-18 17:00:52 | executor | order_filled | Executor filled SELL 23.9 XRPUSDT @ 0.9701 (fee 0.0046 USDT, slippage -0.0012 USDT) |
 | 2026-11-18 17:00:52 | logger | recorded | Logger persisted order filled record |
 | 2026-11-18 17:00:52 | executor | entry_complete | Limit entry filled: 23.9/23.9 XRPUSDT filled, avg 0.9701 |
+| 2026-11-18 17:28:58 | executor | position_closed | Closed XRPUSDT SHORT @ 0.984397 (stop loss): net P&L -0.3581 USDT (fees 0.0164, funding +0.0000) |
+| 2026-11-18 17:28:58 | logger | recorded | Logger persisted position closed record |
+
+</details>
+
+### ETHUSDT futures SHORT · trend · `GB1A1EFD11FAEE2E826` · OPEN
+
+* Planned: entry 1768.65, stop 1784.986351138638, target 1727.8091221534055; qty 0.013, risk 0.2411 USDT (0.152% of futures equity), 1x, net R:R 2.08
+
+| Fill time (UTC) | Order | Purpose | Qty | Price | Ref (mid) | Fee USDT | Slippage USDT |
+|---|---|---|---:|---:|---:|---:|---:|
+| 2026-11-18 18:01:30 | GB1A1EFD11FAEE2E826-E-1 (LIMIT) | entry | 0.013 | 1767.32 | 1767.18 | 0.004595 | -0.001885 |
+
+| Ledger (UTC) | Account | Kind | Amount | Note |
+|---|---|---|---:|---|
+| 2026-11-18 18:01:30 | futures | fee | -0.004595 | entry fee |
+
+<details><summary>Agent trail</summary>
+
+| Time (UTC) | Agent | Event | Message |
+|---|---|---|---|
+| 2026-11-18 18:00:22 | scanner | opportunity | Scanner detected ETHUSDT futures SHORT (trend, 15m, score 0.91): EMA20 < EMA50 < EMA200 downtrend; ADX 42.7; pullback to EMA20 rejected |
+| 2026-11-18 18:00:22 | rugcheck | approved | Rug Check approved ETHUSDT futures |
+| 2026-11-18 18:00:22 | sizer | sized | Sizer: ETHUSDT qty 0.013 (≈22.99 USDT, risk 0.24 USDT = 0.15%, 1x, net R:R 2.08) |
+| 2026-11-18 18:00:22 | risk | risk_approved | Risk manager approved ETHUSDT (16 checks passed) |
+| 2026-11-18 18:00:22 | executor | order_submitted | Executor placed post-only LIMIT SELL 0.013 ETHUSDT @ 1768.82 (futures, paper); expires in 300s |
+| 2026-11-18 18:01:22 | executor | order_repriced | Repriced ETHUSDT limit to 1767.32 for remaining 0.013 (attempt 1/2, status NEW) |
+| 2026-11-18 18:01:30 | executor | order_filled | Executor filled SELL 0.013 ETHUSDT @ 1767.32 (fee 0.0046 USDT, slippage -0.0019 USDT) |
+| 2026-11-18 18:01:30 | logger | recorded | Logger persisted order filled record |
+| 2026-11-18 18:01:30 | executor | entry_complete | Limit entry filled: 0.013/0.013 ETHUSDT filled, avg 1767.32 |
+
+</details>
+
+### BNBUSDT futures SHORT · trend · `GB1A1EFDEDCD23E21CC` · OPEN
+
+* Planned: entry 583.53, stop 586.5976627480218, target 575.8608431299455; qty 0.08, risk 0.3026 USDT (0.191% of futures equity), 1x, net R:R 1.84
+
+| Fill time (UTC) | Order | Purpose | Qty | Price | Ref (mid) | Fee USDT | Slippage USDT |
+|---|---|---|---:|---:|---:|---:|---:|
+| 2026-11-18 18:16:17 | GB1A1EFDEDCD23E21CC-E (LIMIT) | entry | 0.02 | 583.530 | 583.525 | 0.002334 | -0.000100 |
+| 2026-11-18 18:18:22 | GB1A1EFDEDCD23E21CC-E-1 (LIMIT) | entry | 0.06 | 583.390 | 583.385 | 0.007001 | -0.000300 |
+
+| Ledger (UTC) | Account | Kind | Amount | Note |
+|---|---|---|---:|---|
+| 2026-11-18 18:16:17 | futures | fee | -0.002334 | entry fee |
+| 2026-11-18 18:18:22 | futures | fee | -0.007001 | entry fee |
+
+<details><summary>Agent trail</summary>
+
+| Time (UTC) | Agent | Event | Message |
+|---|---|---|---|
+| 2026-11-18 18:15:22 | scanner | opportunity | Scanner detected BNBUSDT futures SHORT (trend, 15m, score 0.91): EMA20 < EMA50 < EMA200 downtrend; ADX 36.4; pullback to EMA20 rejected |
+| 2026-11-18 18:15:23 | rugcheck | approved | Rug Check approved BNBUSDT futures |
+| 2026-11-18 18:15:23 | sizer | sized | Sizer: BNBUSDT qty 0.08 (≈46.68 USDT, risk 0.30 USDT = 0.19%, 1x, net R:R 1.84) |
+| 2026-11-18 18:15:23 | risk | risk_approved | Risk manager approved BNBUSDT (16 checks passed) |
+| 2026-11-18 18:15:23 | executor | order_submitted | Executor placed post-only LIMIT SELL 0.08 BNBUSDT @ 583.530 (futures, paper); expires in 300s |
+| 2026-11-18 18:16:17 | executor | order_filled | Executor filled SELL 0.02 BNBUSDT @ 583.530 (fee 0.0023 USDT, slippage -0.0001 USDT, 0.02/0.08 of order) |
+| 2026-11-18 18:16:17 | logger | recorded | Logger persisted order filled record |
+| 2026-11-18 18:18:08 | executor | order_repriced | Repriced BNBUSDT limit to 583.390 for remaining 0.06 (attempt 1/2, status NEW) |
+| 2026-11-18 18:18:22 | executor | order_filled | Executor filled SELL 0.06 BNBUSDT @ 583.390 (fee 0.0070 USDT, slippage -0.0003 USDT, 0.06/0.08 of order) |
+| 2026-11-18 18:18:22 | logger | recorded | Logger persisted order filled record |
+| 2026-11-18 18:18:22 | executor | entry_complete | Limit entry filled: 0.08/0.08 BNBUSDT filled, avg 583.425 |
 
 </details>
 
 ## Equity
 
-* 41 snapshots; first 534.6822, last 533.3654, min 533.0425, max 534.6822 USDT
-* Realized -0.767777 · unrealized -0.548967 (last snapshot)
+* 115 snapshots; first 534.6822, last 532.3623, min 532.1924, max 534.6822 USDT
+* Realized -1.125873 · unrealized -1.194012 (last snapshot)
 
 ## Independent audit (recomputed from fills and ledger)
 
-**28/28 checks passed.**
+**44/44 checks passed.**
 
 | Check | Result | Expected | Recorded |
 |---|:-:|---:|---:|
@@ -162,22 +245,38 @@ Generated 2026-11-18 17:13:39 UTC from the session database. Mode: **PAPER** (si
 | GB1A1EF8954527D9DD3 funding = ledger funding | ✅ | 0 | 0 |
 | GB1A1EF8954527D9DD3 closed qty = entry qty | ✅ | 5.75 | 5.75 |
 | GB1A1EF8954527D9DD3 realized P&L | ✅ | -0.7677774445750 | -0.7677774445750 |
+| GB1A1EF9A51D31CDD9B entry VWAP | ✅ | 0.9701 | 0.9701 |
+| GB1A1EF9A51D31CDD9B fees | ✅ | 0.0164006202380 | 0.0164006202380 |
+| GB1A1EF9A51D31CDD9B fee rate GB1A1EF9A51D31CDD9B-E | ✅ | 0.0002 | 0.00020000 |
+| GB1A1EF9A51D31CDD9B fee rate GB1A1EF9A51D31CDD9B-X | ✅ | 0.0005 | 0.00050000 |
+| GB1A1EF9A51D31CDD9B margin = qty×entry/leverage | ✅ | 0 | 0 |
+| GB1A1EF9A51D31CDD9B liquidation (Binance isolated formula, MMR 0.5%) | ✅ | 1.930547263681592039800995024875622 | 1.930547263681592039800995024875622 |
+| GB1A1EF9A51D31CDD9B funding = ledger funding | ✅ | 0 | 0 |
+| GB1A1EF9A51D31CDD9B closed qty = entry qty | ✅ | 23.9 | 23.9 |
+| GB1A1EF9A51D31CDD9B realized P&L | ✅ | -0.3580950962380 | -0.3580950962380 |
 | GB1A1EF895217BF127D entry VWAP | ✅ | 0.0577684440 | 0.0577684440 |
 | GB1A1EF895217BF127D fees | ✅ | 0.02608245246600 | 0.02608245246600 |
 | GB1A1EF895217BF127D fee rate GB1A1EF895217BF127D-E | ✅ | 0.0005 | 0.00050000 |
 | GB1A1EF895217BF127D margin = qty×entry/leverage | ✅ | 52.1649049320 | 52.1649049320 |
 | GB1A1EF895217BF127D liquidation (Binance isolated formula, MMR 0.5%) | ✅ | 0.1149620776119402985074626865671642 | 0.1149620776119402985074626865671642 |
 | GB1A1EF895217BF127D funding = ledger funding | ✅ | 0 | 0 |
-| GB1A1EF9A51D31CDD9B entry VWAP | ✅ | 0.9701 | 0.9701 |
-| GB1A1EF9A51D31CDD9B fees | ✅ | 0.004637078 | 0.004637078 |
-| GB1A1EF9A51D31CDD9B fee rate GB1A1EF9A51D31CDD9B-E | ✅ | 0.0002 | 0.00020000 |
-| GB1A1EF9A51D31CDD9B margin = qty×entry/leverage | ✅ | 23.18539 | 23.18539 |
-| GB1A1EF9A51D31CDD9B liquidation (Binance isolated formula, MMR 0.5%) | ✅ | 1.930547263681592039800995024875622 | 1.930547263681592039800995024875622 |
-| GB1A1EF9A51D31CDD9B funding = ledger funding | ✅ | 0 | 0 |
+| GB1A1EFD11FAEE2E826 entry VWAP | ✅ | 1767.32 | 1767.32 |
+| GB1A1EFD11FAEE2E826 fees | ✅ | 0.004595032 | 0.004595032 |
+| GB1A1EFD11FAEE2E826 fee rate GB1A1EFD11FAEE2E826-E-1 | ✅ | 0.0002 | 0.00020000 |
+| GB1A1EFD11FAEE2E826 margin = qty×entry/leverage | ✅ | 22.97516 | 22.97516 |
+| GB1A1EFD11FAEE2E826 liquidation (Binance isolated formula, MMR 0.5%) | ✅ | 3517.054726368159203980099502487562 | 3517.054726368159203980099502487562 |
+| GB1A1EFD11FAEE2E826 funding = ledger funding | ✅ | 0 | 0 |
+| GB1A1EFDEDCD23E21CC entry VWAP | ✅ | 583.425 | 583.425 |
+| GB1A1EFDEDCD23E21CC fees | ✅ | 0.009334800 | 0.009334800 |
+| GB1A1EFDEDCD23E21CC fee rate GB1A1EFDEDCD23E21CC-E | ✅ | 0.0002 | 0.00020000 |
+| GB1A1EFDEDCD23E21CC fee rate GB1A1EFDEDCD23E21CC-E-1 | ✅ | 0.0002 | 0.00020000 |
+| GB1A1EFDEDCD23E21CC margin = qty×entry/leverage | ✅ | 46.67400 | 46.67400 |
+| GB1A1EFDEDCD23E21CC liquidation (Binance isolated formula, MMR 0.5%) | ✅ | 1161.044776119402985074626865671642 | 1161.044776119402985074626865671642 |
+| GB1A1EFDEDCD23E21CC funding = ledger funding | ✅ | 0 | 0 |
 | spot cash: recomputed from fills vs ledger | ✅ | 213.8728769989067032400692888237071 | 213.8728769989067032400692888237071 |
-| futures cash: recomputed from fills vs ledger | ✅ | 159.6061607741390274300519666177803 | 159.6061607741390274300519666177803 |
+| futures cash: recomputed from fills vs ledger | ✅ | 159.2387729239010274300519666177803 | 159.2387729239010274300519666177803 |
 | reserve cash: recomputed from fills vs ledger | ✅ | 160.4046577491800274300519666177803 | 160.4046577491800274300519666177803 |
-| equity identity (open positions marked at entry) | ✅ | 533.8836955222257581001732220592677 | 533.8836955222257581001732220592677 |
+| equity identity (open positions marked at entry) | ✅ | 533.5163076719877581001732220592677 | 533.5163076719877581001732220592677 |
 | no orphan ledger rows | ✅ |  |  |
 
 
@@ -185,26 +284,27 @@ Generated 2026-11-18 17:13:39 UTC from the session database. Mode: **PAPER** (si
 
 # Part B: operator validation trades (stop-loss / take-profit mechanics)
 
-Generated 2026-11-18 17:13:39 UTC from the session database. Mode: **PAPER** (simulated fills on genuine Binance market data; not real performance).
+Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (simulated fills on genuine Binance market data; not real performance).
 
-* Session window: 2026-11-18 17:07:33 → 2026-11-18 17:12:13 UTC (0.08 h of recorded activity)
+* Session window: 2026-11-18 17:07:33 → 2026-11-18 17:24:10 UTC (0.28 h of recorded activity)
 * Capital: ₹50,000 at USD/INR 93.513494 = 534.6822 USDT
 * Market data: Spot production (data-api.binance.vision + data-stream WebSocket); Futures prices from the Binance Futures TESTNET feed (production futures endpoints are geo-blocked in this environment).
-* Process starts: 0 (initial start + 0 restart(s) with open positions; positions and orders persisted, the system came back STOPPED each time, and no order was resubmitted).
 
 ## Pipeline funnel
 
-* Scan cycles: 0 · opportunities detected: 2
-* Rug Check: 2 approved / 0 rejected
-* Sizer: 2 sized / 0 rejected
-* Risk: 2 approved / 0 rejected
-* Executor: 2 orders submitted · 2 fills · 1 positions closed · 0 reprices · 0 limit entries expired unfilled
-* Final opportunity stages: CLOSED 1, OPEN 1
+* Scan cycles: 0 · opportunities detected: 5
+* Rug Check: 4 approved / 1 rejected
+* Sizer: 3 sized / 1 rejected
+* Risk: 3 approved / 0 rejected
+* Executor: 3 orders submitted · 3 fills · 2 positions closed · 0 reprices · 0 limit entries expired unfilled
+* Final opportunity stages: CLOSED 2, REJECTED 2, OPEN 1
 
 ### Why opportunities were not traded
 
 | Reason | Count |
 |---|---:|
+| sizer: net reward/risk 1.43 after costs below minimum 1.5 | 1 |
+| rugcheck: spread | 1 |
 
 ## Trades
 
@@ -241,17 +341,21 @@ Generated 2026-11-18 17:13:39 UTC from the session database. Mode: **PAPER** (si
 
 </details>
 
-### ETHUSDT futures SHORT · validation · `GB1A1EFA0C99BA78660` · OPEN
+### ETHUSDT futures SHORT · validation · `GB1A1EFA0C99BA78660` · CLOSED
 
 * Planned: entry 1756.39, stop 1762.537365, target 1740.5824899999998; qty 0.045, risk 0.3499 USDT (0.218% of futures equity), 1x, net R:R 1.82
+* Result: exit stop_loss @ 1758.68; gross -0.093288, fees 0.079094, funding +0.000000, slippage 0.066738 → **realized -0.172382 USDT**
 
 | Fill time (UTC) | Order | Purpose | Qty | Price | Ref (mid) | Fee USDT | Slippage USDT |
 |---|---|---|---:|---:|---:|---:|---:|
 | 2026-11-18 17:07:35 | GB1A1EFA0C99BA78660-E (MARKET) | entry | 0.045 | 1756.61 | 1756.98 | 0.039524 | 0.016488 |
+| 2026-11-18 17:23:23 | GB1A1EFA0C99BA78660-X (MARKET) | exit | 0.045 | 1758.68 | 1757.56 | 0.039570 | 0.050250 |
 
 | Ledger (UTC) | Account | Kind | Amount | Note |
 |---|---|---|---:|---|
 | 2026-11-18 17:07:35 | futures | fee | -0.039524 | entry fee |
+| 2026-11-18 17:23:23 | futures | pnl | -0.093288 | close ETHUSDT (stop_loss) |
+| 2026-11-18 17:23:23 | futures | fee | -0.039570 | exit fee |
 
 <details><summary>Agent trail</summary>
 
@@ -264,17 +368,46 @@ Generated 2026-11-18 17:13:39 UTC from the session database. Mode: **PAPER** (si
 | 2026-11-18 17:07:35 | executor | order_submitted | Executor submitted SELL MARKET 0.045 ETHUSDT (futures, paper) |
 | 2026-11-18 17:07:35 | executor | order_filled | Executor filled SELL 0.045 ETHUSDT @ 1756.61 (fee 0.0395 USDT, slippage 0.0165 USDT) |
 | 2026-11-18 17:07:35 | logger | recorded | Logger persisted order filled record |
+| 2026-11-18 17:23:23 | executor | position_closed | Closed ETHUSDT SHORT @ 1758.68 (stop loss): net P&L -0.1724 USDT (fees 0.0791, funding +0.0000) |
+| 2026-11-18 17:23:23 | logger | recorded | Logger persisted position closed record |
+
+</details>
+
+### BTCUSDT spot LONG · validation · `GB1A1EFAFEE75BBB5B8` · OPEN
+
+* Planned: entry 63287.2, stop 63002.397645000005, target 64141.56706500001; qty 0.00168000, risk 0.7244 USDT (0.340% of spot equity), 1x, net R:R 1.64
+
+| Fill time (UTC) | Order | Purpose | Qty | Price | Ref (mid) | Fee USDT | Slippage USDT |
+|---|---|---|---:|---:|---:|---:|---:|
+| 2026-11-18 17:24:08 | GB1A1EFAFEE75BBB5B8-E (MARKET) | entry | 0.00168000 | 63307.7 | 63295.0 | 0.106357 | 0.021276 |
+
+| Ledger (UTC) | Account | Kind | Amount | Note |
+|---|---|---|---:|---|
+| 2026-11-18 17:24:08 | spot | trade | -106.356867 | buy BTCUSDT |
+| 2026-11-18 17:24:08 | spot | fee | -0.106357 | entry fee |
+
+<details><summary>Agent trail</summary>
+
+| Time (UTC) | Agent | Event | Message |
+|---|---|---|---|
+| 2026-11-18 17:24:06 | scanner | opportunity | Scanner detected BTCUSDT spot LONG (validation, 1m, score 1.00): operator validation trade: stop 0.45%, target 1.35% (not a strategy signal) |
+| 2026-11-18 17:24:08 | rugcheck | approved | Rug Check approved BTCUSDT spot |
+| 2026-11-18 17:24:08 | sizer | sized | Sizer: BTCUSDT qty 0.00168000 (≈106.33 USDT, risk 0.72 USDT = 0.34%, 1x, net R:R 1.64) |
+| 2026-11-18 17:24:08 | risk | risk_approved | Risk manager approved BTCUSDT (17 checks passed) |
+| 2026-11-18 17:24:08 | executor | order_submitted | Executor submitted BUY MARKET 0.00168000 BTCUSDT (spot, paper) |
+| 2026-11-18 17:24:08 | executor | order_filled | Executor filled BUY 0.00168000 BTCUSDT @ 63307.7 (fee 0.1064 USDT, slippage 0.0213 USDT) |
+| 2026-11-18 17:24:08 | logger | recorded | Logger persisted order filled record |
 
 </details>
 
 ## Equity
 
-* 11 snapshots; first 534.6822, last 534.2133, min 534.1093, max 534.6822 USDT
-* Realized -0.731433 · unrealized +0.262517 (last snapshot)
+* 85 snapshots; first 534.6822, last 533.5468, min 533.2935, max 534.6822 USDT
+* Realized -0.903814 · unrealized -0.231532 (last snapshot)
 
 ## Independent audit (recomputed from fills and ledger)
 
-**20/20 checks passed.**
+**27/27 checks passed.**
 
 | Check | Result | Expected | Recorded |
 |---|:-:|---:|---:|
@@ -288,13 +421,20 @@ Generated 2026-11-18 17:13:39 UTC from the session database. Mode: **PAPER** (si
 | GB1A1EFA0C40CB43F93 closed qty = entry qty | ✅ | 0.00169000 | 0.00169000 |
 | GB1A1EFA0C40CB43F93 realized P&L | ✅ | -0.73143250772670000000000 | -0.73143250772670000000000 |
 | GB1A1EFA0C99BA78660 entry VWAP | ✅ | 1756.608608 | 1756.608608 |
-| GB1A1EFA0C99BA78660 fees | ✅ | 0.0395236936800 | 0.0395236936800 |
+| GB1A1EFA0C99BA78660 fees | ✅ | 0.0790940311650 | 0.0790940311650 |
 | GB1A1EFA0C99BA78660 fee rate GB1A1EFA0C99BA78660-E | ✅ | 0.0005 | 0.00050000 |
-| GB1A1EFA0C99BA78660 margin = qty×entry/leverage | ✅ | 79.047387360 | 79.047387360 |
+| GB1A1EFA0C99BA78660 fee rate GB1A1EFA0C99BA78660-X | ✅ | 0.0005 | 0.00050000 |
+| GB1A1EFA0C99BA78660 margin = qty×entry/leverage | ✅ | 0 | 0 |
 | GB1A1EFA0C99BA78660 liquidation (Binance isolated formula, MMR 0.5%) | ✅ | 3495.738523383084577114427860696517 | 3495.738523383084577114427860696517 |
 | GB1A1EFA0C99BA78660 funding = ledger funding | ✅ | 0 | 0 |
-| spot cash: recomputed from fills vs ledger | ✅ | 213.1414444911800032400692888237071 | 213.1414444911800032400692888237071 |
-| futures cash: recomputed from fills vs ledger | ✅ | 160.3651340555000274300519666177803 | 160.3651340555000274300519666177803 |
+| GB1A1EFA0C99BA78660 closed qty = entry qty | ✅ | 0.045 | 0.045 |
+| GB1A1EFA0C99BA78660 realized P&L | ✅ | -0.1723816411650 | -0.1723816411650 |
+| GB1A1EFAFEE75BBB5B8 entry VWAP | ✅ | 63307.659000000000 | 63307.659000000000 |
+| GB1A1EFAFEE75BBB5B8 fees | ✅ | 0.10635686712000000000000 | 0.10635686712000000000000 |
+| GB1A1EFAFEE75BBB5B8 fee rate GB1A1EFAFEE75BBB5B8-E | ✅ | 0.001 | 0.00100000 |
+| GB1A1EFAFEE75BBB5B8 funding = ledger funding | ✅ | 0 | 0 |
+| spot cash: recomputed from fills vs ledger | ✅ | 106.6782205040600032400692888237071 | 106.6782205040600032400692888237071 |
+| futures cash: recomputed from fills vs ledger | ✅ | 160.2322761080150274300519666177803 | 160.2322761080150274300519666177803 |
 | reserve cash: recomputed from fills vs ledger | ✅ | 160.4046577491800274300519666177803 | 160.4046577491800274300519666177803 |
-| equity identity (open positions marked at entry) | ✅ | 533.9112362958600581001732220592677 | 533.9112362958600581001732220592677 |
+| equity identity (open positions marked at entry) | ✅ | 533.6720214812550581001732220592677 | 533.6720214812550581001732220592677 |
 | no orphan ledger rows | ✅ |  |  |

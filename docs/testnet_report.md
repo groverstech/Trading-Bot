@@ -1,6 +1,6 @@
 # Binance testnet validation report
 
-Run 2026-11-18 16:49:35 UTC · symbol BTCUSDT · host: vm
+Run 2026-11-18 16:59:25 UTC · symbol BTCUSDT · host: vm
 
 Only Binance TEST environments are contacted (testnet.binance.vision, testnet.binancefuture.com). Responses below are the exchange's actual replies (signatures/keys removed).
 
@@ -8,9 +8,9 @@ Only Binance TEST environments are contacted (testnet.binance.vision, testnet.bi
 
 | # | Step | Result | Note | ms |
 |---:|---|:-:|---|---:|
-| 1 | connectivity + server time | FAIL |  | 394 |
-| 2 | clock sync (offset ms) | FAIL |  | 35 |
-| 3 | exchange filters (precision / min size / min notional) | FAIL |  | 37 |
+| 1 | connectivity + server time | FAIL |  | 388 |
+| 2 | clock sync (offset ms) | FAIL |  | 36 |
+| 3 | exchange filters (precision / min size / min notional) | FAIL |  | 38 |
 | 4 | market data | SKIPPED | https://testnet.binance.vision not reachable from this environment |  |
 | 5 | signed steps | SKIPPED | https://testnet.binance.vision not reachable from this environment |  |
 
@@ -49,11 +49,11 @@ Only Binance TEST environments are contacted (testnet.binance.vision, testnet.bi
 
 | # | Step | Result | Note | ms |
 |---:|---|:-:|---|---:|
-| 1 | connectivity + server time | PASS | serverTime 1795020572268 | 555 |
-| 2 | clock sync (offset ms) | PASS | offset 2 ms | 191 |
-| 3 | exchange filters (precision / min size / min notional) | PASS | min notional 50 | 407 |
-| 4 | market data (ticker, book, klines, depth) | PASS | bid 62376.40 / ask 62393.90 | 1447 |
-| 5 | signed request reaches exchange (dummy key → expected rejection) | PASS | exchange answered -2015 | 875 |
+| 1 | connectivity + server time | PASS | serverTime 1795021163489 | 629 |
+| 2 | clock sync (offset ms) | PASS | offset 0 ms | 196 |
+| 3 | exchange filters (precision / min size / min notional) | PASS | min notional 50 | 363 |
+| 4 | market data (ticker, book, klines, depth) | PASS | bid 62513.70 / ask 62545.20 | 1144 |
+| 5 | signed request reaches exchange (dummy key → expected rejection) | PASS | exchange answered -2015 | 696 |
 | 6 | account balances | SKIPPED | no testnet credentials (set GROK_TESTNET_FUTURES_KEY / _SECRET) |  |
 | 7 | commission rates | SKIPPED | no testnet credentials (set GROK_TESTNET_FUTURES_KEY / _SECRET) |  |
 | 8 | limit order + acknowledgement | SKIPPED | no testnet credentials (set GROK_TESTNET_FUTURES_KEY / _SECRET) |  |
@@ -75,12 +75,12 @@ Only Binance TEST environments are contacted (testnet.binance.vision, testnet.bi
 **1. connectivity + server time**
 ```json
 {
- "serverTime": 1795020572268
+ "serverTime": 1795021163489
 }
 ```
 **2. clock sync (offset ms)**
 ```json
-2
+0
 ```
 **3. exchange filters (precision / min size / min notional)**
 ```json
@@ -95,10 +95,10 @@ Only Binance TEST environments are contacted (testnet.binance.vision, testnet.bi
 **4. market data (ticker, book, klines, depth)**
 ```json
 {
- "last": "62376.40",
- "bid": "62376.40",
- "ask": "62393.90",
- "mark": "62407.80443841",
+ "last": "62545.20",
+ "bid": "62513.70",
+ "ask": "62545.20",
+ "mark": "62541.47329710",
  "funding": "0.00010000",
  "klines": 5,
  "depth_levels": [
@@ -116,4 +116,24 @@ Only Binance TEST environments are contacted (testnet.binance.vision, testnet.bi
  "path": "/fapi/v3/account"
 }
 ```
+</details>
+
+## Spot: full application pipeline — 0 pass · 0 fail · 1 skipped
+
+| # | Step | Result | Note | ms |
+|---:|---|:-:|---|---:|
+| 1 | application pipeline round trip | SKIPPED | no testnet credentials (GROK_TESTNET_SPOT_KEY / _SECRET) |  |
+
+<details><summary>Exchange responses</summary>
+
+</details>
+
+## USDⓈ-M Futures: full application pipeline — 0 pass · 0 fail · 1 skipped
+
+| # | Step | Result | Note | ms |
+|---:|---|:-:|---|---:|
+| 1 | application pipeline round trip | SKIPPED | no testnet credentials (GROK_TESTNET_FUTURES_KEY / _SECRET) |  |
+
+<details><summary>Exchange responses</summary>
+
 </details>

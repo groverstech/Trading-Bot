@@ -143,6 +143,8 @@ class FakeBinance:
         # ---------------- signed
         if "signature" not in q:
             return self._json({"code": -2015, "msg": "missing signature"}, 401)
+        if path == "/fapi/v1/listenKey":
+            return self._json({"listenKey": "fake-listen-key"})
         if path == "/sapi/v1/account/apiRestrictions":
             return self._json({"enableWithdrawals": self.withdrawals_enabled, "enableSpotAndMarginTrading": True,
                                "enableFutures": True, "ipRestrict": True})
@@ -155,8 +157,15 @@ class FakeBinance:
             return self._json([{"asset": "USDT", "balance": "5000", "availableBalance": "5000"}])
         if path == "/fapi/v1/positionSide/dual":
             return self._json({"dualSidePosition": self.hedge_mode})
-        if path in ("/fapi/v1/leverage", "/fapi/v1/marginType"):
-            return self._json({"ok": True})
+        if path == "/fapi/v1/leverage":
+            return self._json({"symbol": q["symbol"], "leverage": int(q["leverage"]), "maxNotionalValue": "1000000"})
+        if path == "/fapi/v1/marginType":
+            return self._json({"code": 200, "msg": "success"})
+        if path in ("/api/v3/account/commission", "/fapi/v1/commissionRate"):
+            return self._json({"symbol": q["symbol"], "standardCommission": {"taker": "0.001", "maker": "0.001"},
+                               "takerCommissionRate": "0.0005", "makerCommissionRate": "0.0002"})
+        if path == "/fapi/v1/openAlgoOrders":
+            return self._json([v for v in self.algo.values() if v.get("algoStatus") == "NEW"])
         if path in ("/api/v3/order", "/fapi/v1/order"):
             cid = q.get("newClientOrderId") or q.get("origClientOrderId")
             if request.method == "POST":
@@ -192,7 +201,8 @@ class FakeBinance:
                 o.pop("fills", None)
                 return self._json(o)
         if path == "/api/v3/myTrades":
-            return self._json([t for t in self.trades if t["market"] == "spot" and str(t["orderId"]) == q.get("orderId")])
+            return self._json([t for t in self.trades if t["market"] == "spot" and t["symbol"] == q["symbol"]
+                               and (not q.get("orderId") or str(t["orderId"]) == q.get("orderId"))])
         if path == "/fapi/v1/userTrades":
             ts = [t for t in self.trades if t["market"] == "futures" and t["symbol"] == q["symbol"]]
             if q.get("orderId"):
@@ -221,7 +231,12 @@ class FakeBinance:
                 return self._json({"ok": True})
             return self._json(self.algo.get(cid, {}))
         if path == "/fapi/v3/positionRisk":
-            return self._json([{"symbol": q.get("symbol"), "positionAmt": str(self.positions.get(q.get("symbol"), 0.0))}])
+            sym = q.get("symbol")
+            amt = self.positions.get(sym, 0.0)
+            ep = self.prices.get(sym, 0)
+            return self._json([{"symbol": sym, "positionAmt": str(amt), "entryPrice": str(ep), "leverage": "2",
+                                "liquidationPrice": f"{ep * 0.5 / 0.996:.2f}" if amt > 0 else "0", "markPrice": str(ep),
+                                "isolatedMargin": "0", "notional": str(amt * ep)}])
         if path == "/fapi/v1/income":
             return self._json([])
         return self._json({"code": -1, "msg": f"unhandled {request.method} {path}"}, 404)

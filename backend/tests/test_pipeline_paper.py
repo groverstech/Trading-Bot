@@ -173,3 +173,50 @@ async def test_paper_funding_applied_once(engine, fake):
     assert float(pos["funding"]) < 0  # long pays positive funding
     assert engine.db.scalar("SELECT COUNT(*) FROM ledger WHERE kind='funding'") == 1
     ledger_identity(engine)
+
+
+@pytest.mark.safety
+async def test_entry_drift_rejected_like_paper_session_link(engine, fake):
+    """Regression for the paper-session finding: a SHORT signal priced at an
+    old candle close (8.947) while the market already trades at 8.885 doubled
+    the real stop distance. The risk engine must reject such drift."""
+    fake.prices["ETHUSDT"] = 2979.0  # signal entry 3000; market 0.7% lower
+    await engine.md.refresh_futures(True)
+    tid = await run_trade(engine, candidate("futures", "ETHUSDT", direction="SHORT", entry=3000.0, stop_pct=0.65, rr=3))
+    t = engine.orch.trade(tid)
+    # layer 1: the Sizer re-prices from the executable bid and the net R:R collapses
+    assert t["stage"] == "REJECTED" and "net reward/risk" in t["reject_reason"]
+    # layer 2: even when R:R survives (distant target), the risk engine rejects the drift
+    tid2 = await run_trade(engine, candidate("futures", "ETHUSDT", direction="SHORT", entry=3000.0, stop_pct=0.65,
+                                             rr=12, candle=2))
+    t2 = engine.orch.trade(tid2)
+    assert t2["stage"] == "REJECTED" and "entry_drift" in t2["reject_reason"]
+    assert engine.db.scalar("SELECT COUNT(*) FROM orders") == 0
+
+
+async def test_sizer_uses_executable_price(engine, fake):
+    fake.prices["BTCUSDT"] = 60030.0  # small favourable/neutral drift
+    await engine.md.refresh_spot()
+    tid = await run_trade(engine, candidate("spot", "BTCUSDT", entry=60000.0))
+    sz = engine.orch.trade(tid)["sizing"]
+    assert sz["calc"]["executable_entry"] == pytest.approx(60030.005, abs=0.01)
+    assert D(sz["entry"]) == D(str(sz["calc"]["executable_entry"]))
+
+
+@pytest.mark.safety
+async def test_scanner_drops_signals_from_stale_candles(engine, fake):
+    """After a restart the last closed 1h candle may be ~an hour old: no trade."""
+    from grokbot.strategy import strategies as st
+    engine.cfg.update("automation", {"paper_research_mode": True}, "test")
+    engine.cfg.update("scanner", {"timeframes": ["1h"], "confirm_timeframes": ["4h"], "markets": ["spot"],
+                                  "spot_symbols": ["BTCUSDT"]}, "test")
+    import time as _t
+    c = await engine.md.klines("spot", "BTCUSDT", "1h", 300)
+    c.close_time[-1] = (_t.time() - 1800) * 1000  # closed 30 min ago
+    orig = st.STRATEGIES["momentum"]
+    st.STRATEGIES["momentum"] = lambda ctx, p: st.Signal("momentum", "LONG", 60000, 59000, 63000, 0.9, ["forced"], {})
+    try:
+        cands = await engine.scanner.scan()
+    finally:
+        st.STRATEGIES["momentum"] = orig
+    assert cands == [] and engine.scanner.metrics.get("stale_signals_dropped", 0) >= 1

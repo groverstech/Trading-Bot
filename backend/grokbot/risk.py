@@ -101,6 +101,14 @@ class RiskEngine:
         direction = trade["direction"]
         add("stop_loss_set", (direction == "LONG" and stop < entry) or (direction == "SHORT" and stop > entry),
             f"stop {stop} vs entry {entry}")
+        # Executable price must not have run away from the signal price.
+        sig_entry = D(trade["signal"]["entry"]) if isinstance(trade.get("signal"), dict) else entry
+        sig_stop = D(trade["signal"]["stop"]) if isinstance(trade.get("signal"), dict) else stop
+        planned = abs(sig_entry - sig_stop)
+        adverse = (sig_entry - entry) if direction == "SHORT" else (entry - sig_entry)
+        add("entry_drift", planned > 0 and adverse <= planned * D("0.25"),
+            f"executable {entry} vs signal {sig_entry}: adverse drift {adverse / planned * 100 if planned else 0:.0f}% "
+            f"of stop distance (max 25%)")
         add("min_reward_risk", sizing["rr_net"] >= r.min_reward_risk, f"net R:R {sizing['rr_net']:.2f} (min {r.min_reward_risk})")
         add("risk_per_trade", sizing["risk_pct"] <= r.max_risk_per_trade_pct + 1e-9,
             f"{sizing['risk_pct']:.3f}% of {market} equity (max {r.max_risk_per_trade_pct}%)")

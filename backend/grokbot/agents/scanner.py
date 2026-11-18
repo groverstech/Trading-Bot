@@ -42,6 +42,17 @@ class ScannerAgent(Agent):
                 hc = await self.md.klines(market, symbol, ctf, 250)
                 htf[ctf] = ind.trend_direction(hc.close)
         sigs, nots = evaluate(c, enabled, htf, allow_short=(market == "futures"))
+        # A signal is only actionable shortly after its candle closed. After a
+        # restart (or a slow cycle) the last closed candle can be old and the
+        # market far from its close price, so such signals are discarded.
+        if len(c):
+            age = time.time() - c.close_time[-1] / 1000
+            max_age = min(max(120.0, 2.0 * self.cfg.scanner.interval_seconds), TF_SECONDS[tf] * 0.5)
+            if sigs and age > max_age:
+                from ..strategy.strategies import NoTrade
+                nots += [NoTrade(sg.strategy, f"stale signal: candle closed {age:.0f}s ago (max {max_age:.0f}s)") for sg in sigs]
+                self.bump("stale_signals_dropped", len(sigs))
+                sigs = []
         mode = self.mode_fn() if self.mode_fn else "paper"
         if not (mode == "paper" and self.cfg.automation.paper_research_mode):
             kept = []

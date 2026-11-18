@@ -14,7 +14,7 @@ SCANNER → RUG CHECK → SIZER → CENTRAL RISK → EXECUTOR → LOGGER → EQU
 # backend (Python ≥ 3.11)
 cd backend
 pip install -r requirements.txt
-python -m pytest -q                      # 45 tests (29 marked "safety")
+python -m pytest -q                      # 66 tests (41 marked "safety")
 
 # frontend
 cd ../frontend
@@ -27,6 +27,23 @@ GROK_ADMIN_PASSWORD='choose-a-long-password' python -m grokbot
 ```
 
 For frontend development, run `npm run dev` in `frontend/`. It proxies `/api` and `/ws` to `GROK_API` (default `http://127.0.0.1:8800`).
+
+### Tools
+
+| Command | Purpose |
+|---|---|
+| `python -m grokbot` | Run the terminal (API + UI + agents) |
+| `python -m grokbot.research [--apply]` | Walk-forward strategy research. `--apply` records promotion decisions; this is the only way a strategy can trade on testnet/live. Report: `docs/strategy_report.md` |
+| `python -m grokbot.testnet_validate --market both [--pipeline]` | Binance **testnet** validation with recorded exchange responses. See `docs/TESTNET.md` |
+| `python -m grokbot.audit [--mode paper]` | Independent recomputation of balances, fees, margin, liquidation and P&L from fills and the ledger |
+| `python -m grokbot.paper_report` | Paper-session evidence report from the database |
+
+### Documentation
+
+* `docs/TESTNET.md`: testnet status and local procedure. `docs/testnet_report.md`: latest harness output.
+* `docs/STRATEGY_RESEARCH.md`: why the strategies underperform. `docs/strategy_report.md`: full walk-forward tables.
+* `docs/paper_session_report.md`: end-to-end paper-trading evidence.
+* `docs/AUDIT.md`: financial and security audit.
 
 ### Environment variables
 
@@ -42,6 +59,11 @@ For frontend development, run `npm run dev` in `frontend/`. It proxies `/api` an
 | `GROK_SPOT_TESTNET_URL` / `GROK_FUTURES_TESTNET_URL` | `testnet.binance.vision` / `testnet.binancefuture.com` | Test environments |
 | `GROK_SPOT_LIVE_URL` / `GROK_FUTURES_LIVE_URL` | `api.binance.com` / `fapi.binance.com` | Live trading |
 | `GROK_FX_URL` | `https://open.er-api.com/v6/latest/USD` | USD/INR rate (USDT treated as 1 USD; shown with timestamp) |
+| `GROK_PROFILE` | – | `testnet` points all market data and WebSocket streams at the Binance testnets (required for testnet trading) |
+| `GROK_SPOT_WS_URL` / `GROK_FUTURES_WS_URL` | `data-stream.binance.vision` / `fstream.binance.com` | WebSocket market streams |
+| `GROK_STREAMS` | `1` | `0` disables WebSocket streams (REST polling only) |
+| `GROK_SESSION_IDLE_MINUTES` | `120` | Session idle timeout |
+| `GROK_COOKIE_SECURE` | `0` | `1` forces the Secure cookie flag (behind a TLS reverse proxy) |
 
 ## Architecture
 
@@ -114,19 +136,20 @@ Authorization is revoked on restart, on credential change, on a risk-config chan
 | Futures market data | **Real** from `fapi.binance.com` by default. In the cloud dev container fapi was geo-blocked, so the demo used the **Futures testnet** feed (labelled in the UI) |
 | USD/INR | **Real** (open.er-api.com, daily). USDT assumed = 1 USD |
 | Paper fills | **Simulated** against a fresh real order-book snapshot + configurable extra slippage + Binance base-tier fees |
-| Testnet / live order flow | Implemented. **Verified only against the in-repo mock exchange** (`tests/fake_exchange.py`). Must be validated on the Binance testnets with your keys |
+| Testnet / live order flow | Implemented. Signed flows **verified only against the in-repo mock exchange**. Futures testnet connectivity and market data verified live. See `docs/testnet_report.md` |
+| Market data delivery | Binance **WebSocket** streams (book ticker, 24h ticker, klines, top-20 depth, mark price) with automatic reconnect. REST used for reconciliation and fallback. UI shows LIVE / DELAYED / DISCONNECTED per market |
 | Backtests | Real historical klines. Hypothetical results |
 | Performance statistics | Computed only from recorded trades of the selected mode. Paper, testnet and live are completely separate |
 
 ## Known limitations / outstanding work
 
-* **Testnet validation pending:** signed Spot/Futures flows (OCO, Algo conditional orders, leverage/margin type, commission parsing) have not yet run against Binance's real testnets. No testnet keys were available, and `testnet.binance.vision` is geo-blocked from the development container. The Algo Service parameters (`algoType=CONDITIONAL`, `triggerPrice`, `closePosition`, `clientAlgoId`) follow Binance's docs and change log (migration effective 2025-12-09). Confirm them on testnet first.
-* **Entries are market orders.** The adapters accept LIMIT orders, but the Executor does not yet manage resting limit entries.
-* Market data uses REST polling (3 s), not exchange WebSocket streams. Exchange order state is reconciled by polling (10 s), not the user-data stream.
-* The liquidation price is an approximation (isolated, 0.5 % maintenance rate, no maintenance-amount tiers). Binance's own figure is authoritative.
-* Paper spot fees are modelled in USDT. Exchange modes use the reported commission, converting BNB fees via the BNB spot price.
-* **Strategies are not proven profitable.** A 2,000-bar BTCUSDT 1h backtest (with fees and slippage) showed losses for momentum, volume and volatility, and roughly break-even results for breakout and trend. On 1m/5m timeframes the Sizer rejects most signals because fees make net R:R < 1.5. That is intended behaviour.
-* Single-operator authentication. No built-in TLS: keep it on localhost or behind a TLS reverse proxy.
+* **Testnet:** signed order flows have not yet run against Binance's testnets. No testnet keys were available, and the Spot testnet is geo-blocked (HTTP 451) from the development container; the Futures testnet is reachable and its unauthenticated steps pass. The harness is ready and tested against the mock exchange. Run it locally: `docs/TESTNET.md`.
+* **No strategy is promoted** for automated testnet/live trading; none met the walk-forward criteria after costs (`docs/STRATEGY_RESEARCH.md`). Paper research mode (paper only, off by default) lets unpromoted strategies forward-test.
+* Spot user data is reconciled by REST polling. The Futures user-data stream is used, but only as a trigger for REST reconciliation.
+* Paper limit fills use a conservative model: the price must trade through the order, and queue position is ignored.
+* The liquidation estimate uses a fixed 0.5% maintenance rate. Binance's figure is authoritative, and some altcoin tiers are higher (`docs/AUDIT.md` F2).
+* The master key falls back to a file next to the database; use `GROK_MASTER_KEY` in production.
+* Single-operator authentication, no 2FA, no built-in TLS: keep it on localhost or behind a TLS reverse proxy.
 
 ## Regulatory note (India)
 

@@ -39,10 +39,11 @@ export function Strategies({ toast }: { toast: (m: string, e?: boolean) => void 
       <Research />
       <div className="grid-3" style={{ gridTemplateColumns: "repeat(5, minmax(0,1fr))" }}>
         {Object.entries(draft).map(([name, s]) => (
-          <Panel key={name} title={<>{name} <span className={(s as any).promoted ? "badge-promoted" : "badge-research"}>
-            {(s as any).promoted ? "· PROMOTED" : "· RESEARCH ONLY"}</span></>} accent={s.enabled ? "var(--green)" : "var(--dim)"}
+          <Panel key={name} title={name} accent={(s as any).promoted ? "var(--green)" : "var(--orange)"}
             right={<label className="check"><input type="checkbox" checked={s.enabled}
               onChange={(e) => setDraft({ ...draft, [name]: { ...s, enabled: e.target.checked } })} />enabled</label>}>
+            <div className={`mono ${(s as any).promoted ? "badge-promoted" : "badge-research"}`} style={{ fontSize: 9.5, fontWeight: 800, letterSpacing: ".12em", marginBottom: 6 }}>
+              {(s as any).promoted ? "● PROMOTED · may trade testnet/live" : "● RESEARCH ONLY · not validated for automated trading"}</div>
             <div className="note" style={{ minHeight: 48 }}>{s.info}</div>
             <div className="col" style={{ gap: 6, marginTop: 8 }}>
               {Object.entries(s.params).map(([k, v]) => (

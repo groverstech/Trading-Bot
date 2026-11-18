@@ -94,12 +94,17 @@ class SizerAgent(Agent):
         market, symbol, sig = trade["market"], trade["symbol"], trade["signal"]
         self.busy(f"Sizing {symbol} {sig['direction']}")
         direction = sig["direction"]
-        entry, stop, target = D(sig["entry"]), D(sig["stop"]), D(sig["target"])
+        stop, target = D(sig["stop"]), D(sig["target"])
+        # Size from the price we can actually trade at now, not the candle close.
+        tk = self.md.ticker(market, symbol)
+        exec_px = (tk.ask if direction == "LONG" else tk.bid) if tk and tk.bid and tk.ask else 0
+        entry = D(exec_px) if exec_px else D(sig["entry"])
         rules = self.md.rules[market].get(symbol)
         summary = self.pf.summary(mode)
         m = summary[market]
         equity = D(m["equity"])
-        calc: dict = {"market": market, "equity": float(equity)}
+        calc: dict = {"market": market, "equity": float(equity), "signal_entry": sig["entry"],
+                      "executable_entry": float(entry)}
 
         def reject(reason: str) -> dict:
             self.metrics["rejected"] += 1

@@ -41,6 +41,11 @@ from .util import D, fmt
 SPOT = "https://testnet.binance.vision"
 FUT = "https://testnet.binancefuture.com"
 FUT_WS = "wss://fstream.binancefuture.com"
+TRANSPORT = None  # tests inject a mock transport here
+
+
+def _client(base, market, key=None, secret=None):
+    return BinanceClient(base, market, key, secret, transport=TRANSPORT)
 
 
 def _scrub(o):
@@ -92,7 +97,7 @@ def accepts_error(fn):
 async def run_market(market: str, symbol: str, key: str | None, secret: str | None) -> list[dict]:
     base = SPOT if market == "spot" else FUT
     rec = Recorder(market)
-    pub = BinanceClient(base, market)
+    pub = _client(base, market)
     ad = SpotAdapter(pub) if market == "spot" else FuturesAdapter(pub)
     st: dict = {}
 
@@ -137,7 +142,7 @@ async def run_market(market: str, symbol: str, key: str | None, secret: str | No
         @accepts_error
         def expect_key_rejected(e):
             return (isinstance(e, BinanceError) and e.code in (-2014, -2015, -1022)), f"exchange answered {getattr(e, 'code', e)}"
-        dummy = BinanceClient(base, market, "x" * 64, "y" * 64)
+        dummy = _client(base, market, "x" * 64, "y" * 64)
         await rec.step("signed request reaches exchange (dummy key → expected rejection)",
                        lambda: dummy.request("GET", "/api/v3/account" if market == "spot" else "/fapi/v3/account", signed=True),
                        expect_key_rejected, critical=False)
@@ -152,11 +157,11 @@ async def run_market(market: str, symbol: str, key: str | None, secret: str | No
         return rec.steps
 
     # ---------------- signed
-    tc = BinanceClient(base, market, key, secret)
+    tc = _client(base, market, key, secret)
     tad = SpotAdapter(pub, tc) if market == "spot" else FuturesAdapter(pub, tc)
-    md = MarketData(SpotAdapter(pub), FuturesAdapter(pub)) if market == "spot" else MarketData(SpotAdapter(BinanceClient(SPOT, "spot")), FuturesAdapter(pub), True)
+    md = MarketData(SpotAdapter(pub), FuturesAdapter(pub)) if market == "spot" else MarketData(SpotAdapter(_client(SPOT, "spot")), FuturesAdapter(pub), True)
     md.rules[market][symbol] = st["rules"]
-    broker = ExchangeBroker("testnet", tad if market == "spot" else SpotAdapter(BinanceClient(SPOT, "spot")),
+    broker = ExchangeBroker("testnet", tad if market == "spot" else SpotAdapter(_client(SPOT, "spot")),
                             tad if market == "futures" else FuturesAdapter(pub), md)
     rules = st["rules"]
     tag = f"GBV{int(time.time())}"
@@ -281,7 +286,7 @@ async def run_market(market: str, symbol: str, key: str | None, secret: str | No
                    lambda: (tad.my_trades(symbol, start_time=int((time.time() - 600) * 1000)) if market == "spot"
                             else tad.user_trades(symbol, start_time=int((time.time() - 600) * 1000))),
                    lambda r: (len(r) >= 2, f"{len(r)} fills in last 10 min"))
-    fresh = BinanceClient(base, market, key, secret)
+    fresh = _client(base, market, key, secret)
     fad = SpotAdapter(pub, fresh) if market == "spot" else FuturesAdapter(pub, fresh)
     await rec.step("restart recovery: new client finds entry order by client order id",
                    lambda: fad.query_order(symbol, mcid), lambda r: (r.get("clientOrderId") == mcid, f"status {r.get('status')}"))
@@ -359,12 +364,14 @@ def render(steps: list[dict], meta: dict) -> str:
          f"host: {meta['host']}", "",
          "Only Binance TEST environments are contacted (testnet.binance.vision, testnet.binancefuture.com). "
          "Responses below are the exchange's actual replies (signatures/keys removed).", ""]
-    for m in ("spot", "futures"):
+    for m in ("spot", "futures", "spot-pipeline", "futures-pipeline"):
         ss = [s for s in steps if s["market"] == m]
         if not ss:
             continue
         cnt = {k: sum(1 for s in ss if s["status"] == k) for k in ("PASS", "FAIL", "SKIPPED")}
-        L += [f"## {'Spot' if m == 'spot' else 'USDⓈ-M Futures'} — {cnt['PASS']} pass · {cnt['FAIL']} fail · {cnt['SKIPPED']} skipped", "",
+        title = {"spot": "Spot", "futures": "USDⓈ-M Futures", "spot-pipeline": "Spot: full application pipeline",
+                 "futures-pipeline": "USDⓈ-M Futures: full application pipeline"}[m]
+        L += [f"## {title} — {cnt['PASS']} pass · {cnt['FAIL']} fail · {cnt['SKIPPED']} skipped", "",
               "| # | Step | Result | Note | ms |", "|---:|---|:-:|---|---:|"]
         for i, s in enumerate(ss, 1):
             L.append(f"| {i} | {s['step']} | {s['status']} | {str(s.get('note', '')).replace('|', '/')[:160]} | {s.get('ms', '')} |")
@@ -376,12 +383,77 @@ def render(steps: list[dict], meta: dict) -> str:
     return "\n".join(L)
 
 
+async def run_pipeline(market: str, symbol: str, key: str | None, secret: str | None) -> list[dict]:
+    """Full application path on testnet: a clearly-labelled operator VALIDATION
+    trade goes Rug Check -> Sizer -> central Risk -> Executor (market entry,
+    exchange-side protection) -> manual close, then the books are audited."""
+    rec = Recorder(f"{market}-pipeline")
+    if not key or not secret:
+        rec.skip("application pipeline round trip", f"no testnet credentials (GROK_TESTNET_{market.upper()}_KEY / _SECRET)")
+        return rec.steps
+    if os.environ.get("GROK_PROFILE") != "testnet":
+        rec.skip("application pipeline round trip", "set GROK_PROFILE=testnet so market data comes from the testnet")
+        return rec.steps
+    from . import audit
+    from .engine import Engine
+    from .settings import load_settings
+    from .strategy.strategies import Signal
+    e = Engine(load_settings())
+    st: dict = {}
+    try:
+        e.vault.store_credentials(market, "testnet", key, secret)
+        e.reset_clients()
+        e.md.set_symbols([symbol], [symbol])
+        await e.fx.refresh()
+        await e.md.load_rules()
+        await (e.md.refresh_spot() if market == "spot" else e.md.refresh_futures(True))
+        if e.state.mode != "testnet":
+            e.state.set_mode("testnet", "testnet-validation")
+        e.pf.ensure_initialised("testnet")
+        t = e.md.ticker(market, symbol)
+        mid = (t.bid + t.ask) / 2
+        sig = Signal("validation", "LONG", mid, mid * 0.985, mid * 1.045, 1.0,
+                     ["operator testnet validation trade (not a strategy signal)"], {})
+        cand = {"market": market, "symbol": symbol, "timeframe": "1h", "candle_open": int(time.time()), "signal": sig}
+
+        async def go():
+            tid = e.orch.create_trade("testnet", cand)
+            st["tid"] = tid
+            await e.orch.process(tid)
+            tr = e.orch.trade(tid)
+            return {"trade_id": tid, "stage": tr["stage"], "reason": tr["reject_reason"],
+                    "rugcheck_failed": [c["name"] for c in (tr["rugcheck"] or {}).get("checks", []) if not c["ok"]],
+                    "risk_failed": [c["name"] for c in (tr["risk"] or {}).get("checks", []) if not c["ok"]]}
+        await rec.step("pipeline: scanner→rugcheck→sizer→risk→executor opens position", go,
+                       lambda r: (r["stage"] == "OPEN", f"stage {r['stage']} {r['reason'] or ''}"))
+        pos = e.db.one("SELECT * FROM positions WHERE trade_id=?", (st.get("tid"),))
+        if pos:
+            await rec.step("exchange-side protection recorded", lambda: _const(json.loads(pos["protection"] or "{}")),
+                           lambda r: (r.get("type") in ("spot-oco", "futures-algo"), json.dumps(r)))
+
+            async def close():
+                r = await e.executor.close_position(e.db.one("SELECT * FROM positions WHERE trade_id=?", (st["tid"],)),
+                                                    "manual_close", "testnet-validation")
+                p2 = e.db.one("SELECT status, realized_pnl, fees FROM positions WHERE trade_id=?", (st["tid"],))
+                return {**r, **p2}
+            await rec.step("manual close via executor (cancel protection, reduce-only exit)", close,
+                           lambda r: (r.get("status") == "CLOSED", f"realized {r.get('realized_pnl')} fees {r.get('fees')}"))
+            await rec.step("independent audit of testnet books",
+                           lambda: _const([c for c in audit.run(e.db, "testnet")[0] if not c["ok"]]),
+                           lambda r: (not r, f"{len(r)} mismatches"))
+    finally:
+        await e.close()
+    return rec.steps
+
+
 async def amain(a) -> int:
     steps: list[dict] = []
     for m in (["spot", "futures"] if a.market == "both" else [a.market]):
         key = os.environ.get(f"GROK_TESTNET_{m.upper()}_KEY")
         sec = os.environ.get(f"GROK_TESTNET_{m.upper()}_SECRET")
         steps += await run_market(m, a.symbol, key, sec)
+        if a.pipeline:
+            steps += await run_pipeline(m, a.symbol if m == "spot" else a.symbol, key, sec)
     meta = {"ts": time.time(), "symbol": a.symbol, "host": os.uname().nodename}
     root = Path(__file__).resolve().parents[2]
     (root / "docs").mkdir(exist_ok=True)
@@ -398,6 +470,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--market", choices=["spot", "futures", "both"], default="both")
     ap.add_argument("--symbol", default="BTCUSDT")
+    ap.add_argument("--pipeline", action="store_true",
+                    help="also run an operator validation trade through the full app pipeline (needs GROK_PROFILE=testnet)")
     a = ap.parse_args()
     for h in (SPOT, FUT):
         assert "testnet" in h, "harness may only target testnet hosts"

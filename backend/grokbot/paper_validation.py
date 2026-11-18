@@ -27,7 +27,8 @@ PLANS = [  # market, symbol, direction, stop %, target %
 ]
 
 
-async def main_async(minutes: float) -> None:
+async def main_async(minutes: float, plans=None) -> None:
+    plans = plans or PLANS
     e = Engine(load_settings())
     await e.orch.start()  # market data, WebSocket streams, monitor loop (scanner stays stopped)
     try:
@@ -35,7 +36,7 @@ async def main_async(minutes: float) -> None:
         e.pf.ensure_initialised("paper")
         e.equity.update("paper", "validation start")
         tids = []
-        for market, sym, d, sp, tp in PLANS:
+        for market, sym, d, sp, tp in plans:
             t = e.md.ticker(market, sym)
             px = (t.bid + t.ask) / 2
             k = 1 if d == "LONG" else -1
@@ -63,7 +64,11 @@ async def main_async(minutes: float) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--minutes", type=float, default=60)
-    asyncio.run(main_async(ap.parse_args().minutes))
+    ap.add_argument("--plan", action="append",
+                    help="market:SYMBOL:LONG|SHORT:stop_pct:target_pct (repeatable), e.g. futures:BTCUSDT:SHORT:0.35:0.9")
+    a = ap.parse_args()
+    plans = [(m, s, d, float(sp), float(tp)) for m, s, d, sp, tp in (x.split(":") for x in a.plan)] if a.plan else None
+    asyncio.run(main_async(a.minutes, plans))
 
 
 if __name__ == "__main__":

@@ -117,6 +117,8 @@ CREATE TABLE IF NOT EXISTS backtests (
 MIGRATIONS = [
     ("positions", "protection", "TEXT"),
     ("fills", "net_qty", "TEXT"),
+    ("positions", "exit_meta", "TEXT"),
+    ("positions", "protection_check", "TEXT"),
 ]
 
 

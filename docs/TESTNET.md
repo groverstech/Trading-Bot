@@ -1,82 +1,125 @@
-# Binance testnet validation: status and local procedure
+# Binance testnet validation: status and exact local procedure
 
-## Status from the cloud development environment
+## 1. Status (honest summary)
 
-| Environment | Reachable here | Result |
-|---|---|---|
-| Spot testnet REST `testnet.binance.vision` | ❌ HTTP **451** (geo-restricted) | Must be run locally |
-| Spot testnet streams `stream.testnet.binance.vision` | ✅ | — |
-| USDⓈ-M Futures testnet REST `testnet.binancefuture.com` | ✅ | Connectivity, clock sync, filters and market data **PASS**; a signed request with a dummy key returned the exchange's real `-2015` rejection, which proves signing and routing work |
-| USDⓈ-M Futures testnet streams `fstream.binancefuture.com` | ✅ | Market streams verified |
+| Item | Status |
+|---|---|
+| Spot testnet `testnet.binance.vision` | ❌ HTTP **451** (geo-restricted) from the cloud development environment. **Run locally.** |
+| USDⓈ-M Futures testnet `testnet.binancefuture.com` | ✅ Reachable. Connectivity, clock sync, exchange filters and market data **pass** with real responses. A signed request with a dummy key got the exchange's real `-2015` rejection |
+| Signed order flows (both markets) | ⚠️ **Not yet executed on Binance.** No testnet keys were available. The full lifecycle is verified against the in-repo mock exchange: `tests/test_testnet_harness.py`, including exchange-triggered stop-loss (Futures), exchange-triggered take-profit (Spot OCO), and the cleanup path when nothing triggers |
+| Paper "validation trades" from Phase 2 | These were **simulated**. They used the Futures testnet's public prices, but **no exchange orders** were involved. See `paper_session_report.md` |
 
-**No testnet API keys were available**, so the signed steps (orders, balances, protection, reconciliation) were **not executed against Binance**. They are verified only against the in-repo mock exchange (`tests/test_testnet_harness.py`, `tests/test_limit_orders.py`, `tests/test_exchange_recovery.py`).
+## 2. What `--pipeline` validates (complete lifecycle, per market)
 
-The latest harness output is in [`testnet_report.md`](testnet_report.md). It contains real exchange responses for every step that could run.
+```
+1  market data (testnet book; must come from a testnet host)
+2  signal (operator VALIDATION trade, labelled, not a strategy signal)
+3  Rug Check  ─┐
+4  Sizer       ├─ any rejection is reported; nothing is bypassed
+5  Central risk┘  (includes data_source_matches_mode, exchange_balance, entry_drift)
+6  order submission + exchange acknowledgement + fill (avg price, fee in USDT)
+7  exchange-side SL/TP queried FROM THE EXCHANGE and validated
+     Spot: OCO order list live with LIMIT_MAKER + STOP_LOSS_LIMIT legs covering the quantity
+     Futures: STOP_MARKET + TAKE_PROFIT_MARKET algo orders, closePosition, triggers at the planned levels
+8  wait (default 20 min) for the EXCHANGE to trigger SL or TP
+9  exit fill vs protective level, in bps (a stop-loss does NOT guarantee its price)
+10 reconciliation (system vs exchange) + end-of-test cleanup (default close_all)
+11 equity update (new equity snapshots; realized P&L and fees booked)
+12 independent audit of the testnet books (recomputed from fills and ledger)
+```
 
-## What the harness checks (`python -m grokbot.testnet_validate`)
+The report also contains the adapter-level checks:
+* limit order and acknowledgement;
+* order status;
+* duplicate client-ID rejection;
+* cancellation;
+* market order with fills and commission;
+* partial-fill probe;
+* SL/TP placement, query and cancel;
+* trade history;
+* restart recovery by client order ID;
+* Futures user-data stream.
 
-Spot and Futures are tested separately, and only testnet hosts are contacted:
+It ends with **"Final test-account state"**, queried directly from the exchange: open Futures positions, open orders and open algo orders.
 
-1. Connectivity, server time and clock offset.
-2. Exchange filters: tick size, step size, minimum quantity and minimum notional.
-3. Market data: ticker, book, klines and depth. For Futures, also mark price and funding.
-4. Account balances and commission rates. For Futures, also one-way position mode, ISOLATED margin and 2x leverage.
-5. **Limit order + acknowledgement.** A GTC buy is placed 10% below the market, so it rests on the book.
-6. **Order status** by client order ID.
-7. **Duplicate client order ID is rejected** by the exchange.
-8. **Cancellation** through the broker (cancel, then re-query the final state).
-9. **Market order** through the broker: fills, average price, commission converted to USDT, and net quantity.
-10. **Partial-fill probe.** A marketable limit order larger than the top-of-book size is placed, and the remainder is cancelled.
-11. **Stop-loss + take-profit** through the broker: a Spot OCO via `/api/v3/orderList/oco`, or Futures `STOP_MARKET` + `TAKE_PROFIT_MARKET` via `/fapi/v1/algoOrder` with `closePosition`.
-12. Protection query: the order list or the open algo orders.
-13. **Position reconciliation** through `broker.check_exit`.
-14. For Futures: Binance's liquidation price compared with our estimate.
-15. Cancel protection, then flatten with a reduce-only market order. For Futures, confirm `positionAmt == 0`.
-16. **Trade history**: myTrades or userTrades.
-17. **Restart recovery**: a fresh client finds the entry order by its client order ID.
-18. For Futures: the **user-data stream** delivers `ORDER_TRADE_UPDATE`.
-19. With `--pipeline`: an operator **validation trade** runs through the whole application: Rug Check, Sizer, central Risk, Executor and exchange-side protection, then a manual close and an independent audit of the testnet books. This records a completed testnet round trip, which is one of the live-activation preconditions.
+If neither SL nor TP triggers inside the wait window, that is not a failure. The end-of-test policy then closes the position, and the report says so. Positions are **never** closed while the exchange is unreachable or data is stale; they are reported as kept.
 
-## Local procedure (your machine, India)
+## 3. Exact local procedure (your machine)
 
-Use **test keys only**. Never use production keys for this.
+Use **testnet keys only**. Never use production keys, and never paste keys into chat or commit them.
 
-1. Create testnet API keys:
-   * Spot: https://testnet.binance.vision (log in with GitHub, then "Generate HMAC_SHA256 Key").
-   * USDⓈ-M Futures: https://testnet.binancefuture.com (log in, then the API Key tab at the bottom).
-2. Set up the project:
-   ```bash
-   git clone https://github.com/groverstech/Trading-Bot && cd Trading-Bot
-   git checkout ccr-2e138369-wawg3y
-   cd backend && python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-   pip install -r requirements.txt
-   python -m pytest -q                                              # all tests must pass
-   ```
-3. Run the harness. Put the keys in environment variables; don't paste them anywhere else:
-   ```bash
-   export GROK_TESTNET_SPOT_KEY=...        GROK_TESTNET_SPOT_SECRET=...
-   export GROK_TESTNET_FUTURES_KEY=...     GROK_TESTNET_FUTURES_SECRET=...
-   export GROK_PROFILE=testnet  GROK_DATA_DIR=./data-testnet
-   python -m grokbot.testnet_validate --market both --pipeline
-   ```
-   The harness writes `docs/testnet_report.md`, which includes every exchange response. It exits non-zero on any critical failure.
-4. Optional: run the terminal against the testnet.
-   ```bash
-   GROK_PROFILE=testnet GROK_DATA_DIR=./data-testnet GROK_ADMIN_PASSWORD='a-long-password' python -m grokbot
-   ```
-   Then:
-   1. Store the testnet keys in **Settings → API credentials** (they are encrypted at rest).
-   2. Click **Verify**.
-   3. Switch **Mode → testnet**.
-   4. Press **Start**.
+**Step 1: get test keys.**
+* Spot: log in at https://testnet.binance.vision with GitHub, then **Generate HMAC_SHA256 Key**. Test balances are pre-funded.
+* USDⓈ-M Futures: log in at https://testnet.binancefuture.com, then the **API Key** tab at the bottom of the trading page. The test USDT balance is shown there.
+* The Futures test account must be in **One-way** position mode (the default). The harness checks this.
 
-   With `GROK_PROFILE=testnet`, all market data and streams come from the testnet, so orders are priced from the testnet order books. A risk check blocks testnet orders priced from production data.
+**Step 2: install.**
+```bash
+git clone https://github.com/groverstech/Trading-Bot && cd Trading-Bot
+git checkout ccr-2e138369-wawg3y
+cd backend
+python -m venv .venv && source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python -m pytest -q                                      # expect: all tests pass
+```
 
-   Only **promoted** strategies trade on testnet. None are promoted at present (see `STRATEGY_RESEARCH.md`), so use `--pipeline` above to exercise the full order lifecycle.
-5. Send back `docs/testnet_report.md`. Any failure there should be fixed before anything else.
+**Step 3: set the environment for this shell only.**
+```bash
+export GROK_PROFILE=testnet                 # all market data + streams from the testnets
+export GROK_DATA_DIR=./data-testnet         # separate database; never your paper/live data
+export GROK_TESTNET_SPOT_KEY=...      GROK_TESTNET_SPOT_SECRET=...
+export GROK_TESTNET_FUTURES_KEY=...   GROK_TESTNET_FUTURES_SECRET=...
+# Windows PowerShell: $env:GROK_PROFILE="testnet"  etc.
+```
 
-## Notes and known testnet differences
+**Step 4: preflight** (places nothing).
+```bash
+python -m grokbot.testnet_validate --check
+```
+Expected output: every line `OK`, ending with `13/13 prerequisites met`, exit code 0. Fix any `FAIL` line first. A typical failure is `spot testnet reachable: HTTP Error 451`, meaning your network or region is blocked.
 
-* Testnet liquidity, spreads and prices differ from production. Rug Check may correctly reject testnet books, for example on spread or depth.
-* Testnet balances are reset periodically by Binance.
-* The Spot testnet has no `/sapi` endpoints, so the withdrawal-permission check only runs for **live** keys.
+**Step 5: run the full validation.**
+```bash
+python -m grokbot.testnet_validate --market both --pipeline
+#   options: --wait-minutes 20       how long to wait for the exchange to fire SL/TP
+#            --direction SHORT        futures validation trade direction (spot is always LONG)
+#            --cleanup close_all      end-of-test policy: close_all | cancel_pending | report
+#            --symbol BTCUSDT
+```
+* Expected runtime: about 1–2 minutes of adapter checks, plus up to `--wait-minutes` per market for the lifecycle.
+* Expected console output: one line per step (`[spot] PASS …`, `[futures-pipeline] PASS 7. exchange-side SL/TP present and valid …`). It ends with:
+  ```
+  Test account(s) queried (futures, spot): 0 open futures position(s), 0 open order(s) incl. algo orders.
+  NN steps · 0 critical failures · report: docs/testnet_report.md
+  ```
+* Exit code 0 means no critical failure.
+* `8. wait …` may say "neither level reached in the window". That is not a failure; step 10 then shows the cleanup.
+
+**Step 6: review and send back** `docs/testnet_report.md` (keys and signatures are removed). Check in particular:
+* the step table for each market and pipeline;
+* **"Exchange execution metrics"**: opportunities, approvals and rejections with reasons, orders, fills, partial fills, failed orders, SL/TP exits, slippage, fees, realized P&L, remaining positions and orders, audit;
+* **"Final test-account state"**: it must state 0 open positions and 0 open orders, or list exactly what remains.
+
+**Step 7 (optional): run the terminal against the testnet.**
+```bash
+GROK_PROFILE=testnet GROK_DATA_DIR=./data-testnet GROK_ADMIN_PASSWORD='a-long-password' python -m grokbot
+```
+Then:
+1. Store the test keys in **Settings → API credentials** and click **Verify**.
+2. Set **Mode → testnet**.
+
+Only *promoted* strategies trade on testnet, and none are promoted today, so the scanner will not place trades. Use step 5 for order lifecycles. Stop the terminal with Ctrl-C and run `python -m grokbot.session_end --mode testnet --policy report` to see the remaining exposure.
+
+## 4. If something is left open
+
+```bash
+python -m grokbot.session_end --mode testnet --policy report         # report only
+python -m grokbot.session_end --mode testnet --policy close_all      # cancel pending + close (only if exchange reachable)
+```
+This reconciles the system against the exchange, verifies protective orders, lists the remaining exposure, and ends with an explicit statement of the open positions and orders.
+
+## 5. Known testnet differences
+
+* Testnet books are thinner. Spreads, depth and the mark-vs-last relationship differ from production; Phase 2 observed a lagging testnet book and recurring low wicks. Rug Check may correctly **reject** testnet books on spread or imbalance. That is the system working, not a harness failure.
+* Stop-market orders fill at the book after triggering; fills can be worse or better than the stop level. The report shows the difference in bps.
+* Testnet balances are reset periodically by Binance. The Spot testnet has no `/sapi` endpoints, so the withdrawal-permission check only applies to **live** keys.

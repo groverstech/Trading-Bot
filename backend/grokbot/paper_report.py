@@ -41,6 +41,8 @@ def render(db: Database, mode: str = "paper") -> str:
          *([f"* Process starts: {n_starts} (initial start + {n_starts - 1} restart(s) with open positions; positions and "
             "orders persisted, the system came back STOPPED each time, and no order was resubmitted)."]
            if (n_starts := sum(1 for e in ev if e['event'] == 'equity_updated' and 'startup' in e['message'])) else []), ""]
+    from . import exec_metrics
+    L.append(exec_metrics.render(exec_metrics.compute(db, mode), "Execution metrics"))
     cnt = Counter(e["event"] for e in ev)
     stages = Counter(t["stage"] for t in trades)
     L += ["## Pipeline funnel", "",
@@ -68,6 +70,13 @@ def render(db: Database, mode: str = "paper") -> str:
         L += [f"* Planned: entry {loads(t['signal'])['entry']:.6g}, stop {p['stop_price']}, target {p['target_price']}; "
               f"qty {sz.get('qty')}, risk {sz.get('risk_usdt', 0):.4f} USDT ({sz.get('risk_pct', 0):.3f}% of {p['market']} equity), "
               f"{p['leverage']}x, net R:R {sz.get('rr_net', 0):.2f}" if t else ""]
+        if p.get("exit_meta"):
+            m = json.loads(p["exit_meta"])
+            if m.get("level"):
+                L.append(f"* Exit execution: level {D(m['level']):.6g}, recorded fill {D(m['fill']):.6g}"
+                         + (f" (raw book fill {D(m['book_fill']):.6g})" if m.get("book_fill") and m["book_fill"] != m["fill"] else "")
+                         + f", {m.get('slippage_vs_level_bps', 0):+.1f} bps vs level (+ = worse); trigger: "
+                         f"{m.get('trigger_source')} {m.get('trigger_price') or m.get('trigger_minute_utc') or ''}")
         if p["status"] == "CLOSED":
             L.append(f"* Result: exit {p['exit_reason']} @ {D(p['exit_price']):.6g}; gross {D(p['gross_pnl']):+.6f}, fees "
                      f"{D(p['fees']):.6f}, funding {D(p['funding']):+.6f}, slippage {D(p['slippage']):.6f} → **realized "

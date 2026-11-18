@@ -383,98 +383,285 @@ def render(steps: list[dict], meta: dict) -> str:
     return "\n".join(L)
 
 
-async def run_pipeline(market: str, symbol: str, key: str | None, secret: str | None) -> list[dict]:
-    """Full application path on testnet: a clearly-labelled operator VALIDATION
-    trade goes Rug Check -> Sizer -> central Risk -> Executor (market entry,
-    exchange-side protection) -> manual close, then the books are audited."""
+DEFAULT_LEVELS = {"spot": (0.45, 1.35), "futures": (0.35, 0.90)}   # stop %, target % for validation trades
+
+
+async def run_pipeline(market: str, symbol: str, key: str | None, secret: str | None, *, direction: str = "LONG",
+                       wait_minutes: float = 20.0, cleanup: str = "close_all", stop_pct: float | None = None,
+                       target_pct: float | None = None, db_dir: str | None = None) -> tuple[list[dict], dict | None]:
+    """Full application lifecycle on the TESTNET with a clearly-labelled
+    operator VALIDATION trade (not a strategy signal):
+
+      market data -> signal -> Rug Check -> Sizer -> central Risk -> order
+      submission -> fill -> exchange-side stop-loss/take-profit (verified on
+      the exchange) -> wait for the EXCHANGE to trigger SL or TP -> exit ->
+      reconciliation (system vs exchange) -> equity update -> end-of-test
+      cleanup -> independent audit.
+
+    Nothing here bypasses a control: if Rug Check, the Sizer or the risk
+    engine rejects the trade, that is reported and the lifecycle stops.
+    A stop-loss is never assumed to fill at its level: the actual exit fill
+    and its distance from the level are reported."""
     rec = Recorder(f"{market}-pipeline")
     if not key or not secret:
-        rec.skip("application pipeline round trip", f"no testnet credentials (GROK_TESTNET_{market.upper()}_KEY / _SECRET)")
-        return rec.steps
+        rec.skip("application lifecycle", f"no testnet credentials (GROK_TESTNET_{market.upper()}_KEY / _SECRET)")
+        return rec.steps, None
     if os.environ.get("GROK_PROFILE") != "testnet":
-        rec.skip("application pipeline round trip", "set GROK_PROFILE=testnet so market data comes from the testnet")
-        return rec.steps
-    from . import audit
+        rec.skip("application lifecycle", "set GROK_PROFILE=testnet so all market data comes from the testnet")
+        return rec.steps, None
+    from . import audit, exec_metrics, session_end
     from .engine import Engine
     from .settings import load_settings
     from .strategy.strategies import Signal
-    e = Engine(load_settings())
+    settings = load_settings()
+    if db_dir:
+        from dataclasses import replace
+        from pathlib import Path as _P
+        _P(db_dir).mkdir(parents=True, exist_ok=True)
+        settings = replace(settings, data_dir=_P(db_dir), db_path=_P(db_dir) / "grokbot.db")
+    e = Engine(settings, transport=TRANSPORT)
     st: dict = {}
+    sp, tp = stop_pct or DEFAULT_LEVELS[market][0], target_pct or DEFAULT_LEVELS[market][1]
     try:
         e.vault.store_credentials(market, "testnet", key, secret)
         e.reset_clients()
-        e.md.set_symbols([symbol], [symbol])
-        await e.fx.refresh()
-        await e.md.load_rules()
-        await (e.md.refresh_spot() if market == "spot" else e.md.refresh_futures(True))
+        e.cfg.update("scanner", {"spot_symbols": [symbol], "futures_symbols": [symbol]}, "testnet-validation")
         if e.state.mode != "testnet":
             e.state.set_mode("testnet", "testnet-validation")
+        await e.orch.start()           # market data (+streams), monitor loop, recovery; scanner stays STOPPED
+        await asyncio.sleep(3)
         e.pf.ensure_initialised("testnet")
-        t = e.md.ticker(market, symbol)
-        mid = (t.bid + t.ask) / 2
-        sig = Signal("validation", "LONG", mid, mid * 0.985, mid * 1.045, 1.0,
-                     ["operator testnet validation trade (not a strategy signal)"], {})
-        cand = {"market": market, "symbol": symbol, "timeframe": "1h", "candle_open": int(time.time()), "signal": sig}
+        before = e.pf.summary("testnet")
+        snaps_before = int(e.db.scalar("SELECT COUNT(*) FROM equity_snapshots WHERE mode='testnet'") or 0)
+
+        async def mdata():
+            await (e.md.refresh_spot() if market == "spot" else e.md.refresh_futures(True))
+            t = e.md.ticker(market, symbol)
+            st["mid"] = (t.bid + t.ask) / 2
+            return {"bid": t.bid, "ask": t.ask, "mark": t.mark or None, "age_s": round(e.md.age(market, symbol), 2),
+                    "source": e.md.adapters[market].data.base_url}
+        r = await rec.step("1. market data (testnet book)", mdata,
+                           lambda r: ("testnet" in r["source"] and r["age_s"] < 20, f"bid {r['bid']} ask {r['ask']} from {r['source']}"))
+        if r["status"] != "PASS":
+            return rec.steps, None
+        k = 1 if direction == "LONG" else -1
+        mid = st["mid"]
+        sig = Signal("validation", direction, mid, mid * (1 - k * sp / 100), mid * (1 + k * tp / 100), 1.0,
+                     [f"operator testnet validation trade: stop {sp}%, target {tp}% (not a strategy signal)"], {})
+        cand = {"market": market, "symbol": symbol, "timeframe": "1m", "candle_open": int(time.time()), "signal": sig}
+        await rec.step("2. signal created (operator validation, labelled)", lambda: _const(sig.as_dict()),
+                       lambda r: (True, f"{direction} entry {mid:.6g} SL {sig.stop:.6g} TP {sig.target:.6g}"))
 
         async def go():
             tid = e.orch.create_trade("testnet", cand)
             st["tid"] = tid
             await e.orch.process(tid)
-            tr = e.orch.trade(tid)
-            return {"trade_id": tid, "stage": tr["stage"], "reason": tr["reject_reason"],
-                    "rugcheck_failed": [c["name"] for c in (tr["rugcheck"] or {}).get("checks", []) if not c["ok"]],
-                    "risk_failed": [c["name"] for c in (tr["risk"] or {}).get("checks", []) if not c["ok"]]}
-        await rec.step("pipeline: scanner→rugcheck→sizer→risk→executor opens position", go,
-                       lambda r: (r["stage"] == "OPEN", f"stage {r['stage']} {r['reason'] or ''}"))
-        pos = e.db.one("SELECT * FROM positions WHERE trade_id=?", (st.get("tid"),))
-        if pos:
-            await rec.step("exchange-side protection recorded", lambda: _const(json.loads(pos["protection"] or "{}")),
-                           lambda r: (r.get("type") in ("spot-oco", "futures-algo"), json.dumps(r)))
+            return e.orch.trade(tid)
+        tr = (await rec.step("3-7. Rug Check → Sizer → Risk → order submission → fill", go,
+                             lambda t: (t["stage"] in ("OPEN", "WORKING"), f"stage {t['stage']} {t['reject_reason'] or ''}")))
+        t = e.orch.trade(st["tid"])
+        stages = [("3. Rug Check", t["rugcheck"]), ("4. Sizer", t["sizing"]), ("5. Central risk", t["risk"])]
+        for name, blob in stages:
+            if blob is None:
+                rec.skip(name, "not reached")
+                continue
+            failed = [c["name"] for c in blob.get("checks", []) if not c["ok"]]
+            rec.steps.append({"market": rec.market, "step": name, "status": "PASS" if blob.get("approved") else "FAIL",
+                              "note": "approved" if blob.get("approved") else f"rejected: {blob.get('reason') or failed}",
+                              "response": blob, "ts": time.time()})
+        if t["stage"] not in ("OPEN", "WORKING"):
+            rec.skip("6-12. order lifecycle", f"trade not executed ({t['stage']}): controls rejected it; nothing was bypassed")
+        else:
+            o = e.db.one("SELECT * FROM orders WHERE trade_id=? AND purpose='entry' ORDER BY created_at LIMIT 1", (st["tid"],))
+            rec.steps.append({"market": rec.market, "step": "6. order acknowledged + filled by the exchange",
+                              "status": "PASS" if o and o["status"] in ("FILLED", "PARTIALLY_FILLED") else "FAIL",
+                              "note": f"{o['client_id']} {o['type']} {o['status']} filled {o['filled_qty']} @ {o['avg_price']} "
+                                      f"fee {o['fee_usdt']} USDT", "response": {k2: o[k2] for k2 in o.keys() if k2 != "raw"},
+                              "ts": time.time()})
+            pos = e.db.one("SELECT * FROM positions WHERE trade_id=?", (st["tid"],))
+            await rec.step("7. exchange-side SL/TP present and valid (queried from the exchange)",
+                           lambda: e.executor.verify_protection(pos, e.broker("testnet")),
+                           lambda r: (bool(r.get("ok")), r.get("detail", "")))
+            deadline = time.time() + wait_minutes * 60
 
-            async def close():
-                r = await e.executor.close_position(e.db.one("SELECT * FROM positions WHERE trade_id=?", (st["tid"],)),
-                                                    "manual_close", "testnet-validation")
-                p2 = e.db.one("SELECT status, realized_pnl, fees FROM positions WHERE trade_id=?", (st["tid"],))
-                return {**r, **p2}
-            await rec.step("manual close via executor (cancel protection, reduce-only exit)", close,
-                           lambda r: (r.get("status") == "CLOSED", f"realized {r.get('realized_pnl')} fees {r.get('fees')}"))
-            await rec.step("independent audit of testnet books",
-                           lambda: _const([c for c in audit.run(e.db, "testnet")[0] if not c["ok"]]),
-                           lambda r: (not r, f"{len(r)} mismatches"))
+            async def wait_exit():
+                while time.time() < deadline:
+                    p2 = e.db.one("SELECT status, exit_reason FROM positions WHERE trade_id=?", (st["tid"],))
+                    if p2["status"] == "CLOSED":
+                        return {"closed": True, "reason": p2["exit_reason"], "waited_s": round(wait_minutes * 60 - (deadline - time.time()))}
+                    await asyncio.sleep(5)
+                return {"closed": False, "reason": None, "waited_s": round(wait_minutes * 60)}
+            w = await rec.step(f"8. wait ≤{wait_minutes:g} min for the EXCHANGE to trigger SL or TP", wait_exit,
+                               lambda r: (True, f"exchange closed it: {r['reason']}" if r["closed"] else
+                                          "neither level reached in the window (not a failure; cleanup follows)"),
+                               critical=False)
+            p3 = e.db.one("SELECT * FROM positions WHERE trade_id=?", (st["tid"],))
+            if p3["status"] == "CLOSED":
+                meta = json.loads(p3["exit_meta"] or "{}")
+                rec.steps.append({"market": rec.market, "step": "9. exit fill vs protective level",
+                                  "status": "PASS", "note": f"{p3['exit_reason']} level {meta.get('level')} fill "
+                                  f"{p3['exit_price']} ({meta.get('slippage_vs_level_bps', 0):+.1f} bps; a stop-loss does "
+                                  "NOT guarantee its price)", "response": meta, "ts": time.time()})
+        rep = await session_end.finalize(e, "testnet", cleanup, "test")
+        st["session_end"] = rep
+        clean = not rep["after"]["positions"] and not rep["after"]["pending_orders"] and not rep["after"]["working_entries"]
+        exa = rep.get("exchange_after") or {}
+        ex_flat = not [p for p in exa.get("futures_positions", []) if p["symbol"] == symbol] and \
+            not [o for o in exa.get("futures_open_algo", []) + exa.get("futures_open_orders", []) + exa.get("spot_open_orders", [])
+                 if o.get("symbol") == symbol]
+        rec.steps.append({"market": rec.market, "step": f"10. reconciliation + end-of-test cleanup ({cleanup})",
+                          "status": "PASS" if (clean and ex_flat) or cleanup == "report" else "FAIL",
+                          "note": rep["statement"] + ("" if not rep["reconciliation"] else " · ISSUES: " + "; ".join(rep["reconciliation"])),
+                          "response": {k2: rep[k2] for k2 in ("actions", "reconciliation", "protection", "statement")},
+                          "ts": time.time()})
+        after = e.pf.summary("testnet")
+        snaps_after = int(e.db.scalar("SELECT COUNT(*) FROM equity_snapshots WHERE mode='testnet'") or 0)
+        rec.steps.append({"market": rec.market, "step": "11. equity update",
+                          "status": "PASS" if snaps_after > snaps_before else "FAIL",
+                          "note": f"equity {before['total_equity']:.4f} → {after['total_equity']:.4f} USDT, realized "
+                                  f"{after['realized_pnl'] - before['realized_pnl']:+.6f}, fees {after['fees_paid'] - before['fees_paid']:.6f}, "
+                                  f"{snaps_after - snaps_before} new equity snapshot(s)",
+                          "response": {"before": before["total_equity"], "after": after["total_equity"]}, "ts": time.time()})
+        bad = [c for c in audit.run(e.db, "testnet")[0] if not c["ok"]]
+        rec.steps.append({"market": rec.market, "step": "12. independent audit of testnet books",
+                          "status": "PASS" if not bad else "FAIL", "note": f"{len(bad)} mismatches", "response": bad,
+                          "ts": time.time()})
+        return rec.steps, exec_metrics.compute(e.db, "testnet")
     finally:
         await e.close()
-    return rec.steps
+
+
+async def account_state(key_s, sec_s, key_f, sec_f) -> dict:
+    """What the TEST accounts hold right now, straight from the exchange."""
+    out: dict = {"queried_at": time.time()}
+    if key_f and sec_f:
+        c = _client(FUT, "futures", key_f, sec_f)
+        fa = FuturesAdapter(_client(FUT, "futures"), c)
+        try:
+            out["futures_positions"] = [{k: p.get(k) for k in ("symbol", "positionAmt", "entryPrice", "unRealizedProfit")}
+                                        for p in await fa.position_risk() if Decimal(p.get("positionAmt", "0")) != 0]
+            out["futures_open_orders"] = [{k: o.get(k) for k in ("symbol", "clientOrderId", "type", "status")}
+                                          for o in await fa.open_orders()]
+            algo = await fa.open_conditionals()
+            out["futures_open_algo_orders"] = [{k: o.get(k) for k in ("symbol", "clientAlgoId", "orderType", "type")}
+                                               for o in (algo if isinstance(algo, list) else algo.get("orders", []))]
+        except Exception as ex:  # noqa: BLE001
+            out["futures_error"] = str(ex)
+        await c.close()
+    if key_s and sec_s:
+        c = _client(SPOT, "spot", key_s, sec_s)
+        sa = SpotAdapter(_client(SPOT, "spot"), c)
+        try:
+            out["spot_open_orders"] = [{k: o.get(k) for k in ("symbol", "clientOrderId", "type", "status")}
+                                       for o in await sa.open_orders()]
+        except Exception as ex:  # noqa: BLE001
+            out["spot_error"] = str(ex)
+        await c.close()
+    n_pos = len(out.get("futures_positions", []))
+    n_ord = sum(len(out.get(k, [])) for k in ("futures_open_orders", "futures_open_algo_orders", "spot_open_orders"))
+    queried = [m for m, kk in (("futures", key_f), ("spot", key_s)) if kk]
+    out["statement"] = (f"Test account(s) queried ({', '.join(queried) or 'none: no credentials'}): "
+                        f"{n_pos} open futures position(s), {n_ord} open order(s) incl. algo orders."
+                        + (" Spot holdings are balances, not positions; see the pipeline cleanup step." if key_s else ""))
+    return out
+
+
+def preflight() -> int:
+    """Check prerequisites without placing anything. Exit code 0 = ready."""
+    import importlib
+    import re
+    import sys
+    import urllib.request
+    rows = []
+
+    def chk(name, ok, detail):
+        rows.append((name, ok, detail))
+    chk("python >= 3.11", sys.version_info >= (3, 11), sys.version.split()[0])
+    for mod in ("fastapi", "httpx", "numpy", "cryptography", "websockets", "pydantic"):
+        try:
+            importlib.import_module(mod)
+            chk(f"module {mod}", True, "installed")
+        except ImportError:
+            chk(f"module {mod}", False, "pip install -r requirements.txt")
+    chk("GROK_PROFILE=testnet (needed for --pipeline)", os.environ.get("GROK_PROFILE") == "testnet",
+        os.environ.get("GROK_PROFILE") or "not set")
+    for m in ("SPOT", "FUTURES"):
+        k, s_ = os.environ.get(f"GROK_TESTNET_{m}_KEY", ""), os.environ.get(f"GROK_TESTNET_{m}_SECRET", "")
+        fmt_ok = bool(re.fullmatch(r"[A-Za-z0-9]{16,256}", k)) and bool(re.fullmatch(r"[A-Za-z0-9]{16,256}", s_))
+        chk(f"GROK_TESTNET_{m}_KEY/_SECRET", fmt_ok, "present, format OK" if fmt_ok else "missing or malformed")
+    for name, url in (("spot testnet reachable", f"{SPOT}/api/v3/ping"), ("futures testnet reachable", f"{FUT}/fapi/v1/ping")):
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                chk(name, r.status == 200, f"HTTP {r.status}")
+        except Exception as ex:  # noqa: BLE001
+            chk(name, False, str(ex)[:80])
+    for k in ("GROK_ALLOW_LIVE",):
+        chk("live trading NOT enabled in this shell", os.environ.get(k) != "1", f"{k}={os.environ.get(k, '0')}")
+    for name, ok, detail in rows:
+        print(f"{'OK  ' if ok else 'FAIL'}  {name}: {detail}")
+    bad = [r for r in rows if not r[1]]
+    print(f"\n{len(rows) - len(bad)}/{len(rows)} prerequisites met" + ("" if not bad else " — fix the FAIL lines first"))
+    return 1 if bad else 0
 
 
 async def amain(a) -> int:
+    from . import exec_metrics
     steps: list[dict] = []
+    metrics: dict[str, dict] = {}
+    creds = {m: (os.environ.get(f"GROK_TESTNET_{m.upper()}_KEY"), os.environ.get(f"GROK_TESTNET_{m.upper()}_SECRET"))
+             for m in ("spot", "futures")}
     for m in (["spot", "futures"] if a.market == "both" else [a.market]):
-        key = os.environ.get(f"GROK_TESTNET_{m.upper()}_KEY")
-        sec = os.environ.get(f"GROK_TESTNET_{m.upper()}_SECRET")
+        key, sec = creds[m]
         steps += await run_market(m, a.symbol, key, sec)
         if a.pipeline:
-            steps += await run_pipeline(m, a.symbol if m == "spot" else a.symbol, key, sec)
-    meta = {"ts": time.time(), "symbol": a.symbol, "host": os.uname().nodename}
+            ps, mt = await run_pipeline(m, a.symbol, key, sec, direction="LONG" if m == "spot" else a.direction,
+                                        wait_minutes=a.wait_minutes,
+                                        cleanup=a.cleanup, db_dir=os.path.join(os.environ.get("GROK_DATA_DIR", "data"),
+                                                                               f"testnet-pipeline-{m}"))
+            steps += ps
+            if mt:
+                metrics[m] = mt
+    acct = await account_state(*creds["spot"], *creds["futures"]) if any(k for k, _ in creds.values()) else \
+        {"statement": "No testnet credentials supplied: no test account was queried and no order was placed."}
+    meta = {"ts": time.time(), "symbol": a.symbol, "host": os.uname().nodename, "pipeline": a.pipeline,
+            "cleanup": a.cleanup, "wait_minutes": a.wait_minutes}
     root = Path(__file__).resolve().parents[2]
     (root / "docs").mkdir(exist_ok=True)
-    (root / "docs" / "testnet_report.md").write_text(render(steps, meta))
+    md = render(steps, meta)
+    md += "\n## Exchange execution metrics (testnet application pipeline)\n\n"
+    md += ("\n".join(exec_metrics.render(v, f"{k} pipeline") for k, v in metrics.items()) if metrics else
+           "_Not available: the application pipeline did not run (no credentials or GROK_PROFILE not testnet)._\n")
+    md += f"\n## Final test-account state\n\n**{acct['statement']}**\n\n```json\n{json.dumps(acct, indent=1, default=str)[:3000]}\n```\n"
+    (root / "docs" / "testnet_report.md").write_text(md)
     out = Path(os.environ.get("GROK_DATA_DIR", root / "data"))
     out.mkdir(parents=True, exist_ok=True)
-    (out / "testnet_report.json").write_text(json.dumps({"meta": meta, "steps": steps}, default=str, indent=1))
+    (out / "testnet_report.json").write_text(json.dumps({"meta": meta, "steps": steps, "metrics": metrics,
+                                                         "account": acct}, default=str, indent=1))
     fails = [s for s in steps if s["status"] == "FAIL" and s.get("critical", True)]
-    print(f"\n{len(steps)} steps · {len(fails)} critical failures · report: docs/testnet_report.md")
+    print(f"\n{acct['statement']}")
+    print(f"{len(steps)} steps · {len(fails)} critical failures · report: docs/testnet_report.md")
     return 1 if fails else 0
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Binance TESTNET validation (never contacts production).")
     ap.add_argument("--market", choices=["spot", "futures", "both"], default="both")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--pipeline", action="store_true",
-                    help="also run an operator validation trade through the full app pipeline (needs GROK_PROFILE=testnet)")
+                    help="also run the full application lifecycle with an operator validation trade (needs GROK_PROFILE=testnet)")
+    ap.add_argument("--direction", choices=["LONG", "SHORT"], default="LONG",
+                    help="validation trade direction (spot is always LONG)")
+    ap.add_argument("--wait-minutes", type=float, default=20.0, help="how long to wait for the exchange to trigger SL/TP")
+    ap.add_argument("--cleanup", choices=["close_all", "cancel_pending", "report"], default="close_all",
+                    help="end-of-test policy (positions are never closed while the exchange is unreachable)")
+    ap.add_argument("--check", action="store_true", help="only verify prerequisites; place nothing")
     a = ap.parse_args()
     for h in (SPOT, FUT):
         assert "testnet" in h, "harness may only target testnet hosts"
+    if a.check:
+        raise SystemExit(preflight())
+    if a.market == "spot":
+        a.direction = "LONG"
     raise SystemExit(asyncio.run(amain(a)))
 
 

@@ -35,30 +35,80 @@ Trades opened after the fix (XRP, and all of Part B) show entry drift of at most
 * **Part B:**
   * Round 1: the BTC spot long and ETH futures short both exited at their **stop-loss**. The ETH stop triggered on the testnet mark price and filled below the stop level because of a gap between the testnet mark and its book (AUDIT F10).
   * Round 2: the futures BTC short was rejected by the **Sizer** (net R:R 1.43 < 1.5) and the futures ETH long by **Rug Check** (spread and order-book imbalance on the testnet book). The validation trades got no exemption.
-  * The round-2 BTC long was still open when the 60-minute run ended.
+  * The round-2 BTC long was still open when the 60-minute run ended. It was unmonitored after that (see Phase 2.1 below).
 * **A take-profit exit did not occur on live prices during this session.** The take-profit path is exercised by the automated tests: `test_spot_trade_full_lifecycle`, `test_independent_audit_after_full_lifecycles`, and the exchange-side OCO/algo placement tests.
 * A Futures WebSocket disconnect (`no close frame received`) occurred and the stream reconnected automatically.
+
+## Phase 2.1 follow-up (investigation and resolution)
+
+**These are SIMULATED results.** No order was sent to any exchange. "Testnet" here only means the Futures *prices* came from the Binance Futures testnet's public feed.
+
+* **ETH stop-loss below the level.**
+  * The stop triggered correctly on the **mark price**, as with Binance's `MARK_PRICE` working type.
+  * Real testnet klines for 17:23 UTC show the mark and the contract price moving from about 1757.9 to about 1765.2 within the minute.
+  * At the trigger instant, the paper fill model's book snapshot was still around 1757.6 (mid). The testnet book also showed a recurring 1751.36 low wick, consistent with a thin book.
+  * The paper model credited a fill *better* than the stop. That was a **simulation defect**, not a trigger defect.
+  * Fixed: paper never credits a stop or target exit better than its level (the raw book fill is kept for audit). Every exit now records trigger source, trigger price, mark, last, bid/ask and fill vs level in bps, and an alert fires above `exit_slippage_alert_bps`.
+  * **A stop-loss never guarantees its execution price.** A stop-market order fills at the prevailing book after triggering.
+* **BTC position open at test end.**
+  * The validation tool ended at its 60-minute cap with no end-of-test procedure. The position was left `OPEN` and **unmonitored**: paper stops exist only in the running monitor.
+  * Resolved with `python -m grokbot.session_end`. Replaying the 1-minute candles showed the stop **was touched at 19:01 UTC**, about 37 minutes after the tool exited. The exit is recorded at the stop level less slippage, as exchange-side protection would have produced.
+  * The strategy session's 3 open positions were also checked: neither stop nor target was touched in 188 unmonitored minutes. They were then closed by the end-of-session `close_all` policy.
+  * **Both paper accounts now have 0 open positions and 0 pending orders.** The end-of-session output is below.
+* Startup now replays candles for any downtime automatically. All tools now finish with an explicit end-of-test procedure.
 
 
 ---
 
 # Part A: strategy forward-test (paper research mode)
 
-Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (simulated fills on genuine Binance market data; not real performance).
+Generated 2026-11-18 21:44:24 UTC from the session database. Mode: **PAPER** (simulated fills on genuine Binance market data; not real performance).
 
-* Session window: 2026-11-18 16:41:45 → 2026-11-18 18:24:21 UTC (1.71 h of recorded activity)
+* Session window: 2026-11-18 16:41:45 → 2026-11-18 21:36:57 UTC (4.92 h of recorded activity)
 * Capital: ₹50,000 at USD/INR 93.513494 = 534.6822 USDT
 * Market data: Spot production (data-api.binance.vision + data-stream WebSocket); Futures prices from the Binance Futures TESTNET feed (production futures endpoints are geo-blocked in this environment).
 * Process starts: 4 (initial start + 3 restart(s) with open positions; positions and orders persisted, the system came back STOPPED each time, and no order was resubmitted).
 
+#### Execution metrics — SIMULATED (paper fills on real market data; no exchange orders)
+
+| Metric | Value |
+|---|---|
+| Opportunities detected | 13 |
+| Approved by central risk | 6 |
+| Rejected | 7 |
+| Other outcomes (expired/cancelled/failed before order) | {'EXPIRED': 1} |
+| Orders submitted | 15 (by purpose {'entry': 10, 'exit': 5}, by type {'MARKET': 7, 'LIMIT': 8}) |
+| Successful fills (orders with fills / fill records) | 11 / 11 |
+| Partial fills | 1 |
+| Failed orders | 0 |
+| Cancelled / expired orders | 5 |
+| Positions opened | 5 |
+| Stop-loss exits | 2 |
+| Take-profit exits | 0 |
+| Other exits | 3 ({'end_of_strategy-session': 3, 'stop_loss': 2}) |
+| Exit fill vs protective level (bps, + = worse) | — |
+| Slippage vs mid at order time (USDT) | 0.101155 |
+| Fees (USDT) | 0.168989 |
+| Realized P&L (USDT, net of fees and funding) | -1.669615 |
+| **Remaining open positions** | **0**  |
+| **Remaining pending orders** | **0**  |
+| Independent audit | 53/53 checks passed |
+
+Rejection reasons:
+
+* risk: no_duplicate:: 4
+* risk: max_positions:: 3
+* rugcheck: spread: 1
+* sizer: notional: 1
+
 ## Pipeline funnel
 
-* Scan cycles: 104 · opportunities detected: 13
+* Scan cycles: 109 · opportunities detected: 13
 * Rug Check: 12 approved / 1 rejected
 * Sizer: 11 sized / 1 rejected
 * Risk: 6 approved / 5 rejected
-* Executor: 6 orders submitted · 6 fills · 2 positions closed · 4 reprices · 1 limit entries expired unfilled
-* Final opportunity stages: REJECTED 7, OPEN 3, CLOSED 2, EXPIRED 1
+* Executor: 6 orders submitted · 6 fills · 5 positions closed · 4 reprices · 1 limit entries expired unfilled
+* Final opportunity stages: REJECTED 7, CLOSED 5, EXPIRED 1
 
 ### Why opportunities were not traded
 
@@ -72,17 +122,21 @@ Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (si
 
 ## Trades
 
-### DOGEUSDT futures SHORT · momentum · `GB1A1EF895217BF127D` · OPEN
+### DOGEUSDT futures SHORT · momentum · `GB1A1EF895217BF127D` · CLOSED
 
 * Planned: entry 0.05872, stop 0.05953188269043757, target 0.057096234619124865; qty 903, risk 0.8013 USDT (0.500% of futures equity), 1x, net R:R 1.74
+* Result: exit end_of_strategy-session @ 0.0587217; gross -0.860828, fees 0.052595, funding +0.000000, slippage 0.030068 → **realized -0.913423 USDT**
 
 | Fill time (UTC) | Order | Purpose | Qty | Price | Ref (mid) | Fee USDT | Slippage USDT |
 |---|---|---|---:|---:|---:|---:|---:|
 | 2026-11-18 16:41:57 | GB1A1EF895217BF127D-E (MARKET) | entry | 903 | 0.0577684 | 0.057785 | 0.026082 | 0.014950 |
+| 2026-11-18 21:36:57 | GB1A1EF895217BF127D-X (MARKET) | exit | 903 | 0.0587217 | 0.058705 | 0.026513 | 0.015118 |
 
 | Ledger (UTC) | Account | Kind | Amount | Note |
 |---|---|---|---:|---|
 | 2026-11-18 16:41:57 | futures | fee | -0.026082 | entry fee |
+| 2026-11-18 21:36:57 | futures | pnl | -0.860828 | close DOGEUSDT (end_of_strategy-session) |
+| 2026-11-18 21:36:57 | futures | fee | -0.026513 | exit fee |
 
 <details><summary>Agent trail</summary>
 
@@ -95,6 +149,8 @@ Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (si
 | 2026-11-18 16:41:57 | executor | order_submitted | Executor submitted SELL MARKET 903 DOGEUSDT (futures, paper) |
 | 2026-11-18 16:41:57 | executor | order_filled | Executor filled SELL 903 DOGEUSDT @ 0.0577684 (fee 0.0261 USDT, slippage 0.0150 USDT) |
 | 2026-11-18 16:41:57 | logger | recorded | Logger persisted order filled record |
+| 2026-11-18 21:36:57 | executor | position_closed | Closed DOGEUSDT SHORT @ 0.0587217 (end of strategy-session): net P&L -0.9134 USDT (fees 0.0526, funding +0.0000) |
+| 2026-11-18 21:36:57 | logger | recorded | Logger persisted position closed record |
 
 </details>
 
@@ -163,17 +219,21 @@ Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (si
 
 </details>
 
-### ETHUSDT futures SHORT · trend · `GB1A1EFD11FAEE2E826` · OPEN
+### ETHUSDT futures SHORT · trend · `GB1A1EFD11FAEE2E826` · CLOSED
 
 * Planned: entry 1768.65, stop 1784.986351138638, target 1727.8091221534055; qty 0.013, risk 0.2411 USDT (0.152% of futures equity), 1x, net R:R 2.08
+* Result: exit end_of_strategy-session @ 1764.68; gross +0.034283, fees 0.016065, funding +0.000000, slippage 0.007447 → **realized +0.018217 USDT**
 
 | Fill time (UTC) | Order | Purpose | Qty | Price | Ref (mid) | Fee USDT | Slippage USDT |
 |---|---|---|---:|---:|---:|---:|---:|
 | 2026-11-18 18:01:30 | GB1A1EFD11FAEE2E826-E-1 (LIMIT) | entry | 0.013 | 1767.32 | 1767.18 | 0.004595 | -0.001885 |
+| 2026-11-18 21:36:57 | GB1A1EFD11FAEE2E826-X (MARKET) | exit | 0.013 | 1764.68 | 1763.96 | 0.011470 | 0.009332 |
 
 | Ledger (UTC) | Account | Kind | Amount | Note |
 |---|---|---|---:|---|
 | 2026-11-18 18:01:30 | futures | fee | -0.004595 | entry fee |
+| 2026-11-18 21:36:57 | futures | pnl | +0.034283 | close ETHUSDT (end_of_strategy-session) |
+| 2026-11-18 21:36:57 | futures | fee | -0.011470 | exit fee |
 
 <details><summary>Agent trail</summary>
 
@@ -188,22 +248,28 @@ Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (si
 | 2026-11-18 18:01:30 | executor | order_filled | Executor filled SELL 0.013 ETHUSDT @ 1767.32 (fee 0.0046 USDT, slippage -0.0019 USDT) |
 | 2026-11-18 18:01:30 | logger | recorded | Logger persisted order filled record |
 | 2026-11-18 18:01:30 | executor | entry_complete | Limit entry filled: 0.013/0.013 ETHUSDT filled, avg 1767.32 |
+| 2026-11-18 21:36:57 | executor | position_closed | Closed ETHUSDT SHORT @ 1764.68 (end of strategy-session): net P&L +0.0182 USDT (fees 0.0161, funding +0.0000) |
+| 2026-11-18 21:36:57 | logger | recorded | Logger persisted position closed record |
 
 </details>
 
-### BNBUSDT futures SHORT · trend · `GB1A1EFDEDCD23E21CC` · OPEN
+### BNBUSDT futures SHORT · trend · `GB1A1EFDEDCD23E21CC` · CLOSED
 
 * Planned: entry 583.53, stop 586.5976627480218, target 575.8608431299455; qty 0.08, risk 0.3026 USDT (0.191% of futures equity), 1x, net R:R 1.84
+* Result: exit end_of_strategy-session @ 578.626; gross +0.383944, fees 0.032480, funding +0.000000, slippage 0.026856 → **realized +0.351464 USDT**
 
 | Fill time (UTC) | Order | Purpose | Qty | Price | Ref (mid) | Fee USDT | Slippage USDT |
 |---|---|---|---:|---:|---:|---:|---:|
 | 2026-11-18 18:16:17 | GB1A1EFDEDCD23E21CC-E (LIMIT) | entry | 0.02 | 583.530 | 583.525 | 0.002334 | -0.000100 |
 | 2026-11-18 18:18:22 | GB1A1EFDEDCD23E21CC-E-1 (LIMIT) | entry | 0.06 | 583.390 | 583.385 | 0.007001 | -0.000300 |
+| 2026-11-18 21:36:57 | GB1A1EFDEDCD23E21CC-X (MARKET) | exit | 0.08 | 578.626 | 578.285 | 0.023145 | 0.027256 |
 
 | Ledger (UTC) | Account | Kind | Amount | Note |
 |---|---|---|---:|---|
 | 2026-11-18 18:16:17 | futures | fee | -0.002334 | entry fee |
 | 2026-11-18 18:18:22 | futures | fee | -0.007001 | entry fee |
+| 2026-11-18 21:36:57 | futures | pnl | +0.383944 | close BNBUSDT (end_of_strategy-session) |
+| 2026-11-18 21:36:57 | futures | fee | -0.023145 | exit fee |
 
 <details><summary>Agent trail</summary>
 
@@ -220,22 +286,33 @@ Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (si
 | 2026-11-18 18:18:22 | executor | order_filled | Executor filled SELL 0.06 BNBUSDT @ 583.390 (fee 0.0070 USDT, slippage -0.0003 USDT, 0.06/0.08 of order) |
 | 2026-11-18 18:18:22 | logger | recorded | Logger persisted order filled record |
 | 2026-11-18 18:18:22 | executor | entry_complete | Limit entry filled: 0.08/0.08 BNBUSDT filled, avg 583.425 |
+| 2026-11-18 21:36:57 | executor | position_closed | Closed BNBUSDT SHORT @ 578.626 (end of strategy-session): net P&L +0.3515 USDT (fees 0.0325, funding +0.0000) |
+| 2026-11-18 21:36:57 | logger | recorded | Logger persisted position closed record |
 
 </details>
 
 ## Equity
 
-* 115 snapshots; first 534.6822, last 532.3623, min 532.1924, max 534.6822 USDT
-* Realized -1.125873 · unrealized -1.194012 (last snapshot)
+* 123 snapshots; first 534.6822, last 533.0126, min 532.1924, max 534.6822 USDT
+* Realized -1.669615 · unrealized +0.000000 (last snapshot)
 
 ## Independent audit (recomputed from fills and ledger)
 
-**44/44 checks passed.**
+**53/53 checks passed.**
 
 | Check | Result | Expected | Recorded |
 |---|:-:|---:|---:|
 | INR→USDT conversion | ✅ | 534.6821924972667581001732220592677 | 534.6821924972668 |
 | allocation sums to starting capital | ✅ | 534.6821924972667581001732220592677 | 534.6821924972667581001732220592677 |
+| GB1A1EF895217BF127D entry VWAP | ✅ | 0.0577684440 | 0.0577684440 |
+| GB1A1EF895217BF127D fees | ✅ | 0.05259531897900 | 0.05259531897900 |
+| GB1A1EF895217BF127D fee rate GB1A1EF895217BF127D-E | ✅ | 0.0005 | 0.00050000 |
+| GB1A1EF895217BF127D fee rate GB1A1EF895217BF127D-X | ✅ | 0.0005 | 0.00050000 |
+| GB1A1EF895217BF127D margin = qty×entry/leverage | ✅ | 0 | 0 |
+| GB1A1EF895217BF127D liquidation (Binance isolated formula, MMR 0.5%) | ✅ | 0.1149620776119402985074626865671642 | 0.1149620776119402985074626865671642 |
+| GB1A1EF895217BF127D funding = ledger funding | ✅ | 0 | 0 |
+| GB1A1EF895217BF127D closed qty = entry qty | ✅ | 903 | 903 |
+| GB1A1EF895217BF127D realized P&L | ✅ | -0.91342341297900 | -0.91342341297900 |
 | GB1A1EF8954527D9DD3 entry VWAP | ✅ | 8.8852226 | 8.8852226 |
 | GB1A1EF8954527D9DD3 fees | ✅ | 0.0514481945750 | 0.0514481945750 |
 | GB1A1EF8954527D9DD3 fee rate GB1A1EF8954527D9DD3-E | ✅ | 0.0005 | 0.00050000 |
@@ -254,29 +331,29 @@ Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (si
 | GB1A1EF9A51D31CDD9B funding = ledger funding | ✅ | 0 | 0 |
 | GB1A1EF9A51D31CDD9B closed qty = entry qty | ✅ | 23.9 | 23.9 |
 | GB1A1EF9A51D31CDD9B realized P&L | ✅ | -0.3580950962380 | -0.3580950962380 |
-| GB1A1EF895217BF127D entry VWAP | ✅ | 0.0577684440 | 0.0577684440 |
-| GB1A1EF895217BF127D fees | ✅ | 0.02608245246600 | 0.02608245246600 |
-| GB1A1EF895217BF127D fee rate GB1A1EF895217BF127D-E | ✅ | 0.0005 | 0.00050000 |
-| GB1A1EF895217BF127D margin = qty×entry/leverage | ✅ | 52.1649049320 | 52.1649049320 |
-| GB1A1EF895217BF127D liquidation (Binance isolated formula, MMR 0.5%) | ✅ | 0.1149620776119402985074626865671642 | 0.1149620776119402985074626865671642 |
-| GB1A1EF895217BF127D funding = ledger funding | ✅ | 0 | 0 |
 | GB1A1EFD11FAEE2E826 entry VWAP | ✅ | 1767.32 | 1767.32 |
-| GB1A1EFD11FAEE2E826 fees | ✅ | 0.004595032 | 0.004595032 |
+| GB1A1EFD11FAEE2E826 fees | ✅ | 0.0160654706290 | 0.0160654706290 |
 | GB1A1EFD11FAEE2E826 fee rate GB1A1EFD11FAEE2E826-E-1 | ✅ | 0.0002 | 0.00020000 |
-| GB1A1EFD11FAEE2E826 margin = qty×entry/leverage | ✅ | 22.97516 | 22.97516 |
+| GB1A1EFD11FAEE2E826 fee rate GB1A1EFD11FAEE2E826-X | ✅ | 0.0005 | 0.00050000 |
+| GB1A1EFD11FAEE2E826 margin = qty×entry/leverage | ✅ | 0 | 0 |
 | GB1A1EFD11FAEE2E826 liquidation (Binance isolated formula, MMR 0.5%) | ✅ | 3517.054726368159203980099502487562 | 3517.054726368159203980099502487562 |
 | GB1A1EFD11FAEE2E826 funding = ledger funding | ✅ | 0 | 0 |
+| GB1A1EFD11FAEE2E826 closed qty = entry qty | ✅ | 0.013 | 0.013 |
+| GB1A1EFD11FAEE2E826 realized P&L | ✅ | 0.0182172713710 | 0.0182172713710 |
 | GB1A1EFDEDCD23E21CC entry VWAP | ✅ | 583.425 | 583.425 |
-| GB1A1EFDEDCD23E21CC fees | ✅ | 0.009334800 | 0.009334800 |
+| GB1A1EFDEDCD23E21CC fees | ✅ | 0.0324798280800 | 0.0324798280800 |
 | GB1A1EFDEDCD23E21CC fee rate GB1A1EFDEDCD23E21CC-E | ✅ | 0.0002 | 0.00020000 |
 | GB1A1EFDEDCD23E21CC fee rate GB1A1EFDEDCD23E21CC-E-1 | ✅ | 0.0002 | 0.00020000 |
-| GB1A1EFDEDCD23E21CC margin = qty×entry/leverage | ✅ | 46.67400 | 46.67400 |
+| GB1A1EFDEDCD23E21CC fee rate GB1A1EFDEDCD23E21CC-X | ✅ | 0.0005 | 0.00050000 |
+| GB1A1EFDEDCD23E21CC margin = qty×entry/leverage | ✅ | 0 | 0 |
 | GB1A1EFDEDCD23E21CC liquidation (Binance isolated formula, MMR 0.5%) | ✅ | 1161.044776119402985074626865671642 | 1161.044776119402985074626865671642 |
 | GB1A1EFDEDCD23E21CC funding = ledger funding | ✅ | 0 | 0 |
+| GB1A1EFDEDCD23E21CC closed qty = entry qty | ✅ | 0.08 | 0.08 |
+| GB1A1EFDEDCD23E21CC realized P&L | ✅ | 0.3514640119200 | 0.3514640119200 |
 | spot cash: recomputed from fills vs ledger | ✅ | 213.8728769989067032400692888237071 | 213.8728769989067032400692888237071 |
-| futures cash: recomputed from fills vs ledger | ✅ | 159.2387729239010274300519666177803 | 159.2387729239010274300519666177803 |
+| futures cash: recomputed from fills vs ledger | ✅ | 158.7350430786790274300519666177803 | 158.7350430786790274300519666177803 |
 | reserve cash: recomputed from fills vs ledger | ✅ | 160.4046577491800274300519666177803 | 160.4046577491800274300519666177803 |
-| equity identity (open positions marked at entry) | ✅ | 533.5163076719877581001732220592677 | 533.5163076719877581001732220592677 |
+| equity identity (open positions marked at entry) | ✅ | 533.0125778267657581001732220592677 | 533.0125778267657581001732220592677 |
 | no orphan ledger rows | ✅ |  |  |
 
 
@@ -284,11 +361,42 @@ Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (si
 
 # Part B: operator validation trades (stop-loss / take-profit mechanics)
 
-Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (simulated fills on genuine Binance market data; not real performance).
+Generated 2026-11-18 21:44:24 UTC from the session database. Mode: **PAPER** (simulated fills on genuine Binance market data; not real performance).
 
-* Session window: 2026-11-18 17:07:33 → 2026-11-18 17:24:10 UTC (0.28 h of recorded activity)
+* Session window: 2026-11-18 17:07:33 → 2026-11-18 21:36:42 UTC (4.49 h of recorded activity)
 * Capital: ₹50,000 at USD/INR 93.513494 = 534.6822 USDT
 * Market data: Spot production (data-api.binance.vision + data-stream WebSocket); Futures prices from the Binance Futures TESTNET feed (production futures endpoints are geo-blocked in this environment).
+
+#### Execution metrics — SIMULATED (paper fills on real market data; no exchange orders)
+
+| Metric | Value |
+|---|---|
+| Opportunities detected | 5 |
+| Approved by central risk | 3 |
+| Rejected | 2 |
+| Other outcomes (expired/cancelled/failed before order) | — |
+| Orders submitted | 6 (by purpose {'entry': 3, 'exit': 3}, by type {'MARKET': 6}) |
+| Successful fills (orders with fills / fill records) | 6 / 6 |
+| Partial fills | 0 |
+| Failed orders | 0 |
+| Cancelled / expired orders | 0 |
+| Positions opened | 3 |
+| Stop-loss exits | 3 |
+| Take-profit exits | 0 |
+| Other exits | 0 ({'stop_loss': 2, 'stop_loss_during_downtime': 1}) |
+| Exit fill vs protective level (bps, + = worse) | BTCUSDT stop_loss_during_downtime +2.0 |
+| Slippage vs mid at order time (USDT) | 0.130463 |
+| Fees (USDT) | 0.503440 |
+| Realized P&L (USDT, net of fees and funding) | -1.650002 |
+| **Remaining open positions** | **0**  |
+| **Remaining pending orders** | **0**  |
+| Independent audit | 30/30 checks passed |
+
+Rejection reasons:
+
+* sizer: net: 1
+* rugcheck: spread: 1
+* rugcheck: book_imbalance: 1
 
 ## Pipeline funnel
 
@@ -296,8 +404,8 @@ Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (si
 * Rug Check: 4 approved / 1 rejected
 * Sizer: 3 sized / 1 rejected
 * Risk: 3 approved / 0 rejected
-* Executor: 3 orders submitted · 3 fills · 2 positions closed · 0 reprices · 0 limit entries expired unfilled
-* Final opportunity stages: CLOSED 2, REJECTED 2, OPEN 1
+* Executor: 3 orders submitted · 3 fills · 3 positions closed · 0 reprices · 0 limit entries expired unfilled
+* Final opportunity stages: CLOSED 3, REJECTED 2
 
 ### Why opportunities were not traded
 
@@ -373,18 +481,23 @@ Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (si
 
 </details>
 
-### BTCUSDT spot LONG · validation · `GB1A1EFAFEE75BBB5B8` · OPEN
+### BTCUSDT spot LONG · validation · `GB1A1EFAFEE75BBB5B8` · CLOSED
 
 * Planned: entry 63287.2, stop 63002.397645000005, target 64141.56706500001; qty 0.00168000, risk 0.7244 USDT (0.340% of spot equity), 1x, net R:R 1.64
+* Exit execution: level 63002.4, recorded fill 62989.8, +2.0 bps vs level (+ = worse); trigger: 1m candle replay after downtime 2026-11-18 19:01
+* Result: exit stop_loss_during_downtime @ 62989.8; gross -0.534008, fees 0.212180, funding +0.000000, slippage 0.021276 → **realized -0.746188 USDT**
 
 | Fill time (UTC) | Order | Purpose | Qty | Price | Ref (mid) | Fee USDT | Slippage USDT |
 |---|---|---|---:|---:|---:|---:|---:|
 | 2026-11-18 17:24:08 | GB1A1EFAFEE75BBB5B8-E (MARKET) | entry | 0.00168000 | 63307.7 | 63295.0 | 0.106357 | 0.021276 |
+| 2026-11-18 21:36:42 | GB1A1EFAFEE75BBB5B8-X (MARKET) | exit | 0.00168000 | 62989.8 | 62989.8 | 0.105823 | 0.000000 |
 
 | Ledger (UTC) | Account | Kind | Amount | Note |
 |---|---|---|---:|---|
 | 2026-11-18 17:24:08 | spot | trade | -106.356867 | buy BTCUSDT |
 | 2026-11-18 17:24:08 | spot | fee | -0.106357 | entry fee |
+| 2026-11-18 21:36:42 | spot | trade | +105.822859 | sell BTCUSDT (stop_loss_during_downtime) |
+| 2026-11-18 21:36:42 | spot | fee | -0.105823 | exit fee |
 
 <details><summary>Agent trail</summary>
 
@@ -397,17 +510,20 @@ Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (si
 | 2026-11-18 17:24:08 | executor | order_submitted | Executor submitted BUY MARKET 0.00168000 BTCUSDT (spot, paper) |
 | 2026-11-18 17:24:08 | executor | order_filled | Executor filled BUY 0.00168000 BTCUSDT @ 63307.7 (fee 0.1064 USDT, slippage 0.0213 USDT) |
 | 2026-11-18 17:24:08 | logger | recorded | Logger persisted order filled record |
+| 2026-11-18 21:36:42 | executor | exit_execution | stop loss during downtime BTCUSDT: level 63002.4, fill 62989.8 (+2.0 bps vs level; trigger 1m candle replay after downtime ; mark-last n/a bps) |
+| 2026-11-18 21:36:42 | executor | position_closed | Closed BTCUSDT LONG @ 62989.8 (stop loss during downtime): net P&L -0.7462 USDT (fees 0.2122, funding +0.0000) |
+| 2026-11-18 21:36:42 | logger | recorded | Logger persisted position closed record |
 
 </details>
 
 ## Equity
 
-* 85 snapshots; first 534.6822, last 533.5468, min 533.2935, max 534.6822 USDT
-* Realized -0.903814 · unrealized -0.231532 (last snapshot)
+* 86 snapshots; first 534.6822, last 533.0322, min 533.0322, max 534.6822 USDT
+* Realized -1.650002 · unrealized +0.000000 (last snapshot)
 
 ## Independent audit (recomputed from fills and ledger)
 
-**27/27 checks passed.**
+**30/30 checks passed.**
 
 | Check | Result | Expected | Recorded |
 |---|:-:|---:|---:|
@@ -430,11 +546,48 @@ Generated 2026-11-18 18:24:43 UTC from the session database. Mode: **PAPER** (si
 | GB1A1EFA0C99BA78660 closed qty = entry qty | ✅ | 0.045 | 0.045 |
 | GB1A1EFA0C99BA78660 realized P&L | ✅ | -0.1723816411650 | -0.1723816411650 |
 | GB1A1EFAFEE75BBB5B8 entry VWAP | ✅ | 63307.659000000000 | 63307.659000000000 |
-| GB1A1EFAFEE75BBB5B8 fees | ✅ | 0.10635686712000000000000 | 0.10635686712000000000000 |
+| GB1A1EFAFEE75BBB5B8 fees | ✅ | 0.212179726357991288398320000 | 0.212179726357991288398320000 |
 | GB1A1EFAFEE75BBB5B8 fee rate GB1A1EFAFEE75BBB5B8-E | ✅ | 0.001 | 0.00100000 |
+| GB1A1EFAFEE75BBB5B8 fee rate GB1A1EFAFEE75BBB5B8-X | ✅ | 0.001 | 0.00100000 |
 | GB1A1EFAFEE75BBB5B8 funding = ledger funding | ✅ | 0 | 0 |
-| spot cash: recomputed from fills vs ledger | ✅ | 106.6782205040600032400692888237071 | 106.6782205040600032400692888237071 |
+| GB1A1EFAFEE75BBB5B8 closed qty = entry qty | ✅ | 0.00168000 | 0.00168000 |
+| GB1A1EFAFEE75BBB5B8 realized P&L | ✅ | -0.746187608366702890078320000 | -0.746187608366702890078320000 |
+| spot cash: recomputed from fills vs ledger | ✅ | 212.3952568828133003499909688237071 | 212.3952568828133003499909688237071 |
 | futures cash: recomputed from fills vs ledger | ✅ | 160.2322761080150274300519666177803 | 160.2322761080150274300519666177803 |
 | reserve cash: recomputed from fills vs ledger | ✅ | 160.4046577491800274300519666177803 | 160.4046577491800274300519666177803 |
-| equity identity (open positions marked at entry) | ✅ | 533.6720214812550581001732220592677 | 533.6720214812550581001732220592677 |
+| equity identity (open positions marked at entry) | ✅ | 533.0321907400083552100949020592677 | 533.0321907400083552100949020592677 |
 | no orphan ledger rows | ✅ |  |  |
+
+
+---
+
+## End-of-session procedures (Phase 2.1)
+
+**Part A:**
+
+### End-of-strategy-session procedure (paper, policy `close_all`)
+
+* Downtime reconciliation: GB1A1EF895217BF127D DOGEUSDT: unmonitored 188 min; neither stop nor target touched in 187 1m candles; monitoring resumes
+* Downtime reconciliation: GB1A1EFD11FAEE2E826 ETHUSDT: unmonitored 188 min; neither stop nor target touched in 187 1m candles; monitoring resumes
+* Downtime reconciliation: GB1A1EFDEDCD23E21CC BNBUSDT: unmonitored 188 min; neither stop nor target touched in 187 1m candles; monitoring resumes
+* Before: 3 open position(s), 0 working entr(y/ies), 0 pending order(s); notional 122.20 USDT, unrealized -0.4286 USDT
+  * DOGEUSDT futures SHORT qty 903 entry 0.0577684 mark 0.0587151 SL 0.0595319 TP 0.0570962 · protection local-monitor · open 295.0 min · uPnL -0.8809
+  * ETHUSDT futures SHORT qty 0.013 entry 1767.32 mark 1763.61 SL 1784.99 TP 1727.81 · protection local-monitor · open 215.4 min · uPnL +0.0436
+  * BNBUSDT futures SHORT qty 0.08 entry 583.425 mark 578.2 SL 586.598 TP 575.861 · protection local-monitor · open 200.7 min · uPnL +0.4087
+  * protection check DOGEUSDT: OK (paper: protected by the local monitor (no exchange order))
+  * protection check ETHUSDT: OK (paper: protected by the local monitor (no exchange order))
+  * protection check BNBUSDT: OK (paper: protected by the local monitor (no exchange order))
+* Action: DOGEUSDT closed exit 0.0587217420, realized -0.91342341297900
+* Action: ETHUSDT closed exit 1764.682866, realized 0.0182172713710
+* Action: BNBUSDT closed exit 578.6257020, realized 0.3514640119200
+
+**After end-of-strategy-session (close_all): 0 open position(s), 0 working entry order(s), 0 pending order(s) recorded by the system. Remaining notional 0.00 USDT, unrealized +0.0000 USDT.**
+
+**Part B:**
+
+### End-of-validation-test procedure (paper, policy `close_all`)
+
+* Downtime reconciliation: GB1A1EFAFEE75BBB5B8 BTCUSDT: stop_loss touched at 2026-11-18 19:01 UTC while unmonitored (253 min); exit recorded at 62989.8
+* Before: 0 open position(s), 0 working entr(y/ies), 0 pending order(s); notional 0.00 USDT, unrealized +0.0000 USDT
+
+**After end-of-validation-test (close_all): 0 open position(s), 0 working entry order(s), 0 pending order(s) recorded by the system. Remaining notional 0.00 USDT, unrealized +0.0000 USDT.**

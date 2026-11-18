@@ -122,7 +122,8 @@ class Engine:
         if mode not in self._brokers:
             spot = SpotAdapter(self.spot_data, self.trade_client(mode, "spot"))
             fut = FuturesAdapter(self.futures_data, self.trade_client(mode, "futures"))
-            self._brokers[mode] = ExchangeBroker(mode, spot, fut, self.md)
+            self._brokers[mode] = ExchangeBroker(mode, spot, fut, self.md,
+                                                 lambda: self.cfg.execution.stop_working_type)
         return self._brokers[mode]
 
     async def _cached_balances(self, mode: str) -> dict:

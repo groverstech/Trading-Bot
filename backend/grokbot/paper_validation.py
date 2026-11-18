@@ -27,7 +27,7 @@ PLANS = [  # market, symbol, direction, stop %, target %
 ]
 
 
-async def main_async(minutes: float, plans=None) -> None:
+async def main_async(minutes: float, plans=None, cleanup: str = "close_all") -> None:
     plans = plans or PLANS
     e = Engine(load_settings())
     await e.orch.start()  # market data, WebSocket streams, monitor loop (scanner stays stopped)
@@ -57,6 +57,10 @@ async def main_async(minutes: float, plans=None) -> None:
         for tid in tids:
             p = e.db.one("SELECT symbol, status, exit_reason, realized_pnl FROM positions WHERE trade_id=?", (tid,))
             print(tid, p, flush=True)
+        # Never leave unmonitored exposure behind: explicit end-of-test procedure.
+        from . import session_end
+        rep = await session_end.finalize(e, "paper", cleanup, "validation-test")
+        print(session_end.render(rep), flush=True)
     finally:
         await e.close()
 
@@ -64,11 +68,13 @@ async def main_async(minutes: float, plans=None) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--minutes", type=float, default=60)
+    ap.add_argument("--cleanup", choices=["close_all", "cancel_pending", "report"], default="close_all",
+                    help="end-of-test policy applied when the run ends")
     ap.add_argument("--plan", action="append",
                     help="market:SYMBOL:LONG|SHORT:stop_pct:target_pct (repeatable), e.g. futures:BTCUSDT:SHORT:0.35:0.9")
     a = ap.parse_args()
     plans = [(m, s, d, float(sp), float(tp)) for m, s, d, sp, tp in (x.split(":") for x in a.plan)] if a.plan else None
-    asyncio.run(main_async(a.minutes, plans))
+    asyncio.run(main_async(a.minutes, plans, a.cleanup))
 
 
 if __name__ == "__main__":

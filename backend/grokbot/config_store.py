@@ -103,6 +103,15 @@ class ExecutionCfg(Strict):
     max_reprices: int = Field(2, ge=0, le=10)
     # Never reprice further than this from the signal's entry price.
     max_chase_bps: float = Field(10, ge=0, le=100)
+    # Futures stop/take-profit trigger: MARK_PRICE (resists wicks/manipulation of the
+    # traded price) or CONTRACT_PRICE (last traded price). Used for exchange-side
+    # algo orders AND the paper monitor so both behave alike.
+    stop_working_type: Literal["MARK_PRICE", "CONTRACT_PRICE"] = "MARK_PRICE"
+    # Paper never credits a stop/target exit better than its level (real stop-market
+    # fills are not guaranteed and are usually worse in fast moves).
+    paper_conservative_exits: bool = True
+    # Exit fills further than this from the protective level are flagged for review.
+    exit_slippage_alert_bps: float = Field(20, gt=0, le=1000)
 
 
 class StrategyCfg(Strict):

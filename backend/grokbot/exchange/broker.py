@@ -209,10 +209,11 @@ class PaperBroker:
 class ExchangeBroker:
     """Testnet or live Binance execution."""
 
-    def __init__(self, env: str, spot: SpotAdapter, futures: FuturesAdapter, md: MarketData):
+    def __init__(self, env: str, spot: SpotAdapter, futures: FuturesAdapter, md: MarketData, working_type=None):
         assert env in ("testnet", "live")
         self.kind = env
         self.spot, self.futures, self.md = spot, futures, md
+        self.working_type = working_type or (lambda: "MARK_PRICE")
 
     def _ad(self, market: str):
         return self.spot if market == "spot" else self.futures
@@ -361,10 +362,62 @@ class ExchangeBroker:
                                      fmt(rules.round_price(stop)), fmt(stop_limit), lid)
             return {"type": "spot-oco", "list_client_id": lid, "version": version}
         close_side = "SELL" if pos["direction"] == "LONG" else "BUY"
-        await self.futures.new_conditional(symbol, close_side, "STOP_MARKET", fmt(rules.round_price(stop)), f"{cid}-SL")
-        await self.futures.new_conditional(symbol, close_side, "TAKE_PROFIT_MARKET",
-                                           fmt(rules.round_price(target)), f"{cid}-TP")
-        return {"type": "futures-algo", "sl": f"{cid}-SL", "tp": f"{cid}-TP"}
+        wt = self.working_type()
+        prev = loads_safe(pos.get("protection"))
+        version = int(prev.get("version", 0)) + 1     # re-placed protection gets fresh client ids
+        sfx = "" if version == 1 else str(version)
+        sl_id, tp_id = f"{cid}-SL{sfx}", f"{cid}-TP{sfx}"
+        await self.futures.new_conditional(symbol, close_side, "STOP_MARKET", fmt(rules.round_price(stop)), sl_id,
+                                           working_type=wt)
+        await self.futures.new_conditional(symbol, close_side, "TAKE_PROFIT_MARKET", fmt(rules.round_price(target)),
+                                           tp_id, working_type=wt)
+        return {"type": "futures-algo", "sl": sl_id, "tp": tp_id, "working_type": wt, "version": version}
+
+    async def verify_protection(self, pos: dict) -> dict:
+        """Check the exchange-side protective orders against the position.
+
+        Spot: the OCO order list must be live (EXECUTING / EXEC_STARTED), contain
+        a stop leg and a take-profit leg, and cover the position quantity.
+        Futures: open algo orders must include this position's STOP_MARKET and
+        TAKE_PROFIT_MARKET (closePosition) with triggers at the configured levels.
+        """
+        market, symbol, tid = pos["market"], pos["symbol"], pos["trade_id"]
+        prot = loads_safe(pos.get("protection"))
+        rules = self.md.rules[market].get(symbol)
+        tick = rules.tick_size if rules else D("0.00000001")
+        if market == "spot":
+            lid = prot.get("list_client_id")
+            if not lid:
+                return {"ok": False, "detail": "no OCO recorded for position"}
+            lst = await self.spot.query_order_list(lid)
+            status = lst.get("listOrderStatus")
+            legs = []
+            for o in lst.get("orders", []):
+                od = await self.spot.query_order(symbol, o["clientOrderId"])
+                legs.append({"client_id": o["clientOrderId"], "type": od.get("type"), "status": od.get("status"),
+                             "qty": od.get("origQty"), "price": od.get("price"), "stop": od.get("stopPrice")})
+            live = status in ("EXECUTING", "EXEC_STARTED")
+            qty_ok = all(D(l["qty"] or "0") >= rules.round_qty(D(pos["qty"]), market_order=False) for l in legs) if legs else False
+            types = {l["type"] for l in legs}
+            ok = live and qty_ok and {"LIMIT_MAKER", "STOP_LOSS_LIMIT"} <= types
+            return {"ok": ok, "detail": f"order list {lid} {status}, legs {sorted(types)}, qty ok {qty_ok}", "legs": legs}
+        raw = await self.futures.open_conditionals(symbol)
+        rows = raw if isinstance(raw, list) else raw.get("orders", [])
+        mine = {o.get("clientAlgoId"): o for o in rows if str(o.get("clientAlgoId", "")).startswith(tid)}
+        sl, tp = mine.get(prot.get("sl", f"{tid}-SL")), mine.get(prot.get("tp", f"{tid}-TP"))
+        issues = []
+        for name, o, level in (("stop-loss", sl, pos["stop_price"]), ("take-profit", tp, pos["target_price"])):
+            if not o:
+                issues.append(f"{name} missing")
+                continue
+            trig = D(o.get("triggerPrice") or o.get("stopPrice") or "0")
+            if rules and abs(trig - rules.round_price(D(level))) > tick:
+                issues.append(f"{name} trigger {trig} != {rules.round_price(D(level))}")
+            if str(o.get("closePosition", "true")).lower() != "true":
+                issues.append(f"{name} not closePosition")
+        return {"ok": not issues, "detail": "; ".join(issues) or "stop-loss and take-profit live",
+                "orders": [{k: o.get(k) for k in ("clientAlgoId", "type", "orderType", "triggerPrice", "workingType",
+                                                   "algoStatus")} for o in mine.values()]}
 
     async def cancel_protection(self, pos: dict) -> None:
         cid = pos["trade_id"]
@@ -373,9 +426,10 @@ class ExchangeBroker:
                 lid = loads_safe(pos.get("protection")).get("list_client_id", f"{cid}-P1")
                 await self.spot.cancel_order_list(pos["symbol"], lid)
             else:
-                for suffix in ("SL", "TP"):
+                prot = loads_safe(pos.get("protection"))
+                for algo_id in (prot.get("sl", f"{cid}-SL"), prot.get("tp", f"{cid}-TP")):
                     try:
-                        await self.futures.cancel_conditional(f"{cid}-{suffix}")
+                        await self.futures.cancel_conditional(algo_id)
                     except BinanceError:
                         pass
         except BinanceError as e:

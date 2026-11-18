@@ -209,6 +209,12 @@ class FakeBinance:
                 ts = [t for t in ts if str(t["orderId"]) == q["orderId"]]
             return self._json(ts)
         if path == "/api/v3/orderList/oco":
+            for leg, typ, px, sp in (("aboveClientOrderId", "LIMIT_MAKER", q.get("abovePrice"), None),
+                                     ("belowClientOrderId", "STOP_LOSS_LIMIT", q.get("belowPrice"), q.get("belowStopPrice"))):
+                self._oid += 1
+                self.orders[q[leg]] = {"symbol": q["symbol"], "orderId": self._oid, "clientOrderId": q[leg], "side": "SELL",
+                                       "type": typ, "price": px, "stopPrice": sp, "origQty": q["quantity"],
+                                       "executedQty": "0", "cummulativeQuoteQty": "0", "status": "NEW", "market": "spot"}
             self.order_lists[q["listClientOrderId"]] = {"listOrderStatus": "EXECUTING", "params": q,
                                                         "orders": [{"clientOrderId": q["aboveClientOrderId"]},
                                                                    {"clientOrderId": q["belowClientOrderId"]}]}
@@ -230,6 +236,15 @@ class FakeBinance:
                     self.algo[cid]["algoStatus"] = "CANCELED"
                 return self._json({"ok": True})
             return self._json(self.algo.get(cid, {}))
+        if path == "/fapi/v3/positionRisk" and not q.get("symbol"):
+            return self._json([{"symbol": k, "positionAmt": str(v), "entryPrice": str(self.prices.get(k, 0)),
+                                "markPrice": str(self.prices.get(k, 0)), "liquidationPrice": "0", "unRealizedProfit": "0"}
+                               for k, v in self.positions.items() if v])
+        if path in ("/api/v3/openOrders", "/fapi/v1/openOrders"):
+            mk = "spot" if path.startswith("/api") else "futures"
+            return self._json([{k: v for k, v in o.items() if k != "fills"} for o in self.orders.values()
+                               if o.get("market") == mk and o["status"] in ("NEW", "PARTIALLY_FILLED")
+                               and (not q.get("symbol") or o["symbol"] == q["symbol"])])
         if path == "/fapi/v3/positionRisk":
             sym = q.get("symbol")
             amt = self.positions.get(sym, 0.0)
@@ -278,12 +293,31 @@ class FakeBinance:
         if market == "futures":
             self.positions[sym] = round(self.positions.get(sym, 0.0) + (qty if side == "BUY" else -qty), 8)
 
+    def trigger_spot_oco(self, list_id: str, leg: str = "stop"):
+        """Exchange executes one OCO leg (stop or take-profit); the other is cancelled."""
+        lst = self.order_lists[list_id]
+        q = lst["params"]
+        cid = q["belowClientOrderId"] if leg == "stop" else q["aboveClientOrderId"]
+        other = q["aboveClientOrderId"] if leg == "stop" else q["belowClientOrderId"]
+        o = self.orders[cid]
+        px = float(q["belowStopPrice"]) * 0.9998 if leg == "stop" else float(q["abovePrice"])
+        qty = float(q["quantity"])
+        o.update(status="FILLED", executedQty=f"{qty:.8f}", cummulativeQuoteQty=f"{qty * px:.8f}")
+        self.orders[other]["status"] = "CANCELED"
+        self.trades.append({"symbol": q["symbol"], "orderId": o["orderId"], "side": "SELL", "qty": f"{qty:.8f}",
+                            "price": f"{px:.8f}", "commission": f"{qty * px * 0.001:.8f}", "commissionAsset": "USDT",
+                            "realizedPnl": "0", "time": int(time.time() * 1000), "market": "spot"})
+        lst["listOrderStatus"] = "ALL_DONE"
+
     # simulate protective stop trigger on futures
     def trigger_futures_stop(self, sym: str, cid_prefix: str):
         amt = self.positions.get(sym, 0.0)
         side = "SELL" if amt > 0 else "BUY"
         self._fill("futures", sym, side, abs(amt), f"{cid_prefix}-SLX")
         self.positions[sym] = 0.0
+        for k, v in self.algo.items():           # the triggered stop and its sibling are done
+            if k.startswith(cid_prefix):
+                v["algoStatus"] = "FINISHED" if "-SL" in k else "CANCELED"
 
 
 def dumps(o):

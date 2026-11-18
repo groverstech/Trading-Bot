@@ -35,6 +35,24 @@ Trades opened after the fix (XRP, and all of Part B) show entry drift of at most
 * **Part B:**
   * Round 1: the BTC spot long and ETH futures short both exited at their **stop-loss**. The ETH stop triggered on the testnet mark price and filled below the stop level because of a gap between the testnet mark and its book (AUDIT F10).
   * Round 2: the futures BTC short was rejected by the **Sizer** (net R:R 1.43 < 1.5) and the futures ETH long by **Rug Check** (spread and order-book imbalance on the testnet book). The validation trades got no exemption.
-  * The round-2 BTC long was still open when the 60-minute run ended.
+  * The round-2 BTC long was still open when the 60-minute run ended. It was unmonitored after that (see Phase 2.1 below).
 * **A take-profit exit did not occur on live prices during this session.** The take-profit path is exercised by the automated tests: `test_spot_trade_full_lifecycle`, `test_independent_audit_after_full_lifecycles`, and the exchange-side OCO/algo placement tests.
 * A Futures WebSocket disconnect (`no close frame received`) occurred and the stream reconnected automatically.
+
+## Phase 2.1 follow-up (investigation and resolution)
+
+**These are SIMULATED results.** No order was sent to any exchange. "Testnet" here only means the Futures *prices* came from the Binance Futures testnet's public feed.
+
+* **ETH stop-loss below the level.**
+  * The stop triggered correctly on the **mark price**, as with Binance's `MARK_PRICE` working type.
+  * Real testnet klines for 17:23 UTC show the mark and the contract price moving from about 1757.9 to about 1765.2 within the minute.
+  * At the trigger instant, the paper fill model's book snapshot was still around 1757.6 (mid). The testnet book also showed a recurring 1751.36 low wick, consistent with a thin book.
+  * The paper model credited a fill *better* than the stop. That was a **simulation defect**, not a trigger defect.
+  * Fixed: paper never credits a stop or target exit better than its level (the raw book fill is kept for audit). Every exit now records trigger source, trigger price, mark, last, bid/ask and fill vs level in bps, and an alert fires above `exit_slippage_alert_bps`.
+  * **A stop-loss never guarantees its execution price.** A stop-market order fills at the prevailing book after triggering.
+* **BTC position open at test end.**
+  * The validation tool ended at its 60-minute cap with no end-of-test procedure. The position was left `OPEN` and **unmonitored**: paper stops exist only in the running monitor.
+  * Resolved with `python -m grokbot.session_end`. Replaying the 1-minute candles showed the stop **was touched at 19:01 UTC**, about 37 minutes after the tool exited. The exit is recorded at the stop level less slippage, as exchange-side protection would have produced.
+  * The strategy session's 3 open positions were also checked: neither stop nor target was touched in 188 unmonitored minutes. They were then closed by the end-of-session `close_all` policy.
+  * **Both paper accounts now have 0 open positions and 0 pending orders.** The end-of-session output is below.
+* Startup now replays candles for any downtime automatically. All tools now finish with an explicit end-of-test procedure.

@@ -59,6 +59,7 @@ class ExecutorAgent(Agent):
                         "limit_orders": 0, "repriced": 0, "expired": 0, "cancelled": 0}
         self._funding_seen: dict[str, tuple[int, float]] = {}
         self._last_exchange_check: dict[str, float] = {}
+        self._last_protection_check: dict[str, float] = {}
         self._closing: set[str] = set()
 
     # ----------------------------------------------------------- helpers
@@ -304,12 +305,12 @@ class ExecutorAgent(Agent):
             return
         try:
             if pos["market"] == "futures":
-                if prot.get("type") == "futures-algo":
+                if prot.get("type") == "futures-algo" and not prot.get("replaced"):
                     return  # closePosition=true orders already cover any size
             else:
-                if prot.get("qty") == pos["qty"]:
+                if prot.get("qty") == pos["qty"] and not prot.get("replaced"):
                     return
-                if prot:
+                if prot and not prot.get("replaced"):
                     await broker.cancel_protection(pos)
                 rules = self.md.rules["spot"].get(pos["symbol"])
                 if rules and D(pos["qty"]) * D(pos["stop_price"]) < rules.min_notional:
@@ -462,7 +463,7 @@ class ExecutorAgent(Agent):
             self._finish_working(trade, reason)
 
     # ------------------------------------------------------------- exit
-    async def close_position(self, pos: dict, reason: str, actor: str = "executor") -> dict:
+    async def close_position(self, pos: dict, reason: str, actor: str = "executor", trigger: dict | None = None) -> dict:
         tid = pos["trade_id"]
         if tid in self._closing:
             return {"ok": False, "reason": "already closing"}
@@ -502,14 +503,56 @@ class ExecutorAgent(Agent):
                         self.log("protection_failed", f"Re-protecting {symbol} failed: {e}", tid, level="error")
                 self.fail(f"exit failed {symbol}")
                 return {"ok": False, "reason": res.error}
+            book_fill = res.avg_price
+            px, fee = res.avg_price, res.fee_usdt
+            if broker.kind == "paper" and reason in ("stop_loss", "take_profit") and self.cfg.execution.paper_conservative_exits:
+                # A real stop-market fills at whatever the book is when it triggers; it is never
+                # guaranteed, and in a fast move usually worse than the stop. Paper never credits
+                # an exit better than its protective level (the raw book fill is kept for audit).
+                level = D(pos["stop_price"] if reason == "stop_loss" else pos["target_price"])
+                long = pos["direction"] == "LONG"
+                worse = min(px, level) if (long and reason == "stop_loss") else max(px, level) if reason == "stop_loss" \
+                    else (min(px, level) if long else max(px, level))
+                if worse != px and px > 0:
+                    fee = fee * worse / px
+                    px = worse
+                    res.raw = {**(res.raw or {}), "book_fill": str(book_fill), "modelled_fill": str(px),
+                               "model": "paper_conservative_exits"}
+                    res.avg_price = px
+                    res.fee_usdt = fee
             self._update_order(cid, res)
-            self._apply_exit(pos, res.filled_qty, res.avg_price, res.fee_usdt, reason, res.slippage_usdt(side), cid, res)
+            meta = self._exit_meta(pos, reason, px, book_fill, trigger, broker.kind)
+            self._apply_exit(pos, res.filled_qty, px, fee, reason, res.slippage_usdt(side), cid, res, meta)
             return {"ok": True}
         finally:
             self._closing.discard(tid)
 
+    def _exit_meta(self, pos: dict, reason: str, fill: Decimal, book_fill: Decimal | None, trigger: dict | None,
+                   kind: str) -> dict:
+        """Execution-quality record for an exit: how the fill compares with the
+        protective level and with the market at trigger time."""
+        long = pos["direction"] == "LONG"
+        level = D(pos["stop_price"] if reason == "stop_loss" else pos["target_price"]) \
+            if reason in ("stop_loss", "take_profit") else None
+        meta = {"reason": reason, "venue": kind, "fill": str(fill),
+                "book_fill": str(book_fill) if book_fill is not None else None, **(trigger or {})}
+        if level is not None and level > 0:
+            # positive = worse than the level for this position direction
+            adverse = (level - fill) if long else (fill - level)
+            meta.update(level=str(level), slippage_vs_level_bps=float(adverse / level * 10_000))
+        t = self.md.ticker(pos["market"], pos["symbol"])
+        if t:
+            meta.setdefault("mark", t.mark or None)
+            meta.setdefault("last", t.price)
+            meta.setdefault("bid", t.bid)
+            meta.setdefault("ask", t.ask)
+            if t.mark and t.price:
+                meta["mark_last_dev_bps"] = round((t.mark - t.price) / t.price * 10_000, 2)
+        meta["data_source"] = self.md.adapters[pos["market"]].data.base_url
+        return meta
+
     def _apply_exit(self, pos: dict, qty: Decimal, price: Decimal, fee: Decimal, reason: str,
-                    slip: Decimal = ZERO, cid: str | None = None, res=None) -> None:
+                    slip: Decimal = ZERO, cid: str | None = None, res=None, meta: dict | None = None) -> None:
         tid, mode, market = pos["trade_id"], pos["mode"], pos["market"]
         d = 1 if pos["direction"] == "LONG" else -1
         entry, held = D(pos["entry_price"]), D(pos["qty"])
@@ -539,13 +582,25 @@ class ExecutorAgent(Agent):
                 realized = g - fees + funding
                 self.db.execute(
                     "UPDATE positions SET status='CLOSED', qty=?, closed_at=?, exit_price=?, exit_reason=?, gross_pnl=?, "
-                    "fees=?, slippage=?, realized_pnl=?, margin='0' WHERE trade_id=?",
-                    (str(held), now(), str(price), reason, str(g), str(fees), str(sl), str(realized), tid))
+                    "fees=?, slippage=?, realized_pnl=?, margin='0', exit_meta=? WHERE trade_id=?",
+                    (str(held), now(), str(price), reason, str(g), str(fees), str(sl), str(realized),
+                     dumps(meta) if meta else None, tid))
                 self.db.execute("UPDATE trades SET stage='CLOSED', status='closed', updated_at=? WHERE id=?", (now(), tid))
             else:
                 self.db.execute(
                     "UPDATE positions SET status='OPEN', qty=?, gross_pnl=?, fees=?, slippage=?, margin=? WHERE trade_id=?",
                     (str(remaining), str(g), str(fees), str(sl), str(margin), tid))
+        if meta and meta.get("slippage_vs_level_bps") is not None:
+            bps = meta["slippage_vs_level_bps"]
+            anomaly = abs(bps) > self.cfg.execution.exit_slippage_alert_bps or (reason == "stop_loss" and bps < -5)
+            self.log("exit_execution",
+                     f"{reason.replace('_', ' ')} {pos['symbol']}: level {D(meta['level']):.6g}, fill {price:.6g} "
+                     f"({bps:+.1f} bps vs level; trigger {meta.get('trigger_source', 'n/a')} "
+                     f"{meta.get('trigger_price', '')}; mark-last {meta.get('mark_last_dev_bps', 'n/a')} bps)"
+                     + (" - ANOMALY: review execution" if anomaly else ""),
+                     tid, meta, "warning" if anomaly else "info")
+            if anomaly:
+                self.metrics["exit_anomalies"] = self.metrics.get("exit_anomalies", 0) + 1
         if dust:
             self.metrics["closed"] += 1
             realized = g - fees + funding
@@ -569,6 +624,10 @@ class ExecutorAgent(Agent):
     async def monitor(self) -> None:
         """Called every ~2 s: working orders, stops/targets/liquidation for
         paper positions, and reconciliation of exchange positions."""
+        if time.time() - getattr(self, "_hb", 0) >= 10:
+            # heartbeat: lets a restart know from when paper positions were unmonitored
+            self._hb = time.time()
+            self.db.meta_set("executor_heartbeat", str(self._hb))
         await self.manage_working()
         positions = self.db.all("SELECT * FROM positions WHERE status='OPEN'")
         if not positions:
@@ -594,8 +653,12 @@ class ExecutorAgent(Agent):
             return  # never act on stale data; protective logic resumes when data is fresh
         if market == "futures":
             self._paper_funding(pos, t)
-        # Same trigger as exchange-side protection: futures MARK_PRICE, spot last/mid.
-        px = D(t.mark) if market == "futures" and t.mark else D(t.price)
+        # Same trigger as exchange-side protection: futures per execution.stop_working_type
+        # (MARK_PRICE by default), spot last traded price.
+        use_mark = market == "futures" and t.mark and self.cfg.execution.stop_working_type == "MARK_PRICE"
+        px = D(t.mark) if use_mark else D(t.price)
+        trig = {"trigger_source": "mark" if use_mark else "last", "trigger_price": str(px), "trigger_ts": time.time(),
+                "mark": t.mark or None, "last": t.price, "bid": t.bid, "ask": t.ask}
         stop, target = D(pos["stop_price"]), D(pos["target_price"])
         long = pos["direction"] == "LONG"
         if market == "futures" and pos["liq_price"]:
@@ -604,9 +667,9 @@ class ExecutorAgent(Agent):
                 await self._paper_liquidate(pos, liq)
                 return
         if (long and px <= stop) or (not long and px >= stop):
-            await self.close_position(pos, "stop_loss")
+            await self.close_position(pos, "stop_loss", trigger=trig)
         elif (long and px >= target) or (not long and px <= target):
-            await self.close_position(pos, "take_profit")
+            await self.close_position(pos, "take_profit", trigger=trig)
 
     async def _paper_liquidate(self, pos: dict, liq: Decimal) -> None:
         cur = self.db.execute("UPDATE positions SET status='CLOSING' WHERE trade_id=? AND status='OPEN'", (pos["trade_id"],))
@@ -656,19 +719,147 @@ class ExecutorAgent(Agent):
                 self.db.execute("UPDATE positions SET last_funding_ts=? WHERE trade_id=?", (time.time(), tid))
         if not loads(pos.get("protection")):
             return  # protection not active yet (e.g. spot partial below minimum): nothing to reconcile
-        ex = await broker.check_exit(pos)
+        ex = await broker.check_exit(pos)   # reconcile exits FIRST: a fired stop is not "missing protection"
         if ex.closed:
             cur = self.db.execute("UPDATE positions SET status='CLOSING' WHERE trade_id=? AND status='OPEN'", (tid,))
             if cur.rowcount == 1:
                 if ex.qty <= 0:
                     ex.qty, ex.exit_price = D(pos["qty"]), self.pf.mark_price(pos) or D(pos["entry_price"])
-                self._apply_exit(pos, ex.qty, ex.exit_price, ex.fee_usdt, ex.reason)
+                meta = self._exit_meta(pos, ex.reason, ex.exit_price, ex.exit_price,
+                                       {"trigger_source": f"exchange ({self.cfg.execution.stop_working_type})"},
+                                       broker.kind)
+                # Record the exchange-executed exit as an order + fill so the trail and audit are complete.
+                from ..exchange.broker import ExecResult
+                n = int(self.db.scalar("SELECT COUNT(*) FROM orders WHERE trade_id=? AND purpose='exit'", (tid,)) or 0)
+                cid = client_order_id(tid, "XR", n)
+                self._order_row(cid, pos, "SELL" if pos["direction"] == "LONG" else "BUY", ex.qty, "exit",
+                                "EXCHANGE_PROTECTION")
+                res = ExecResult("FILLED", ex.qty, ex.exit_price, ex.fee_usdt, ZERO, exchange_id=f"protection:{ex.reason}",
+                                 raw={"exchange_triggered": True, "reason": ex.reason})
+                self._update_order(cid, res)
+                self._apply_exit(pos, ex.qty, ex.exit_price, ex.fee_usdt, ex.reason, ZERO, cid, res, meta)
                 self.log("reconciled_exit", f"Exchange reports {pos['symbol']} closed ({ex.reason})", tid)
+            return
+        if time.time() - self._last_protection_check.get(tid, 0) >= 60:
+            self._last_protection_check[tid] = time.time()
+            await self.verify_protection(pos, broker)
+
+    async def verify_protection(self, pos: dict, broker) -> dict:
+        """Confirm the exchange still holds valid stop-loss / take-profit orders
+        for this position; re-place them (and raise an incident) if not."""
+        if broker.kind == "paper":
+            return {"ok": True, "detail": "paper: protected by the local monitor (no exchange order)"}
+        try:
+            res = await broker.verify_protection(pos)
+        except Exception as e:  # noqa: BLE001 - cannot verify: report, do not act blindly
+            self.log("protection_unverified", f"Could not verify protection for {pos['symbol']}: {e}",
+                     pos["trade_id"], level="warning")
+            return {"ok": None, "detail": str(e)}
+        self.db.execute("UPDATE positions SET protection_check=? WHERE trade_id=?",
+                        (dumps({**res, "ts": time.time()}), pos["trade_id"]))
+        if not res.get("ok"):
+            # Protective orders also disappear when they EXECUTE. Re-check the position on
+            # the exchange before re-placing anything, so a closed position never gets new orders.
+            try:
+                ex = await broker.check_exit(pos)
+            except Exception as e:  # noqa: BLE001
+                self.log("protection_unverified", f"Protection invalid for {pos['symbol']} but position state unknown "
+                         f"({e}); not re-placing blindly", pos["trade_id"], res, "error")
+                return {"ok": None, "detail": f"position state unknown: {e}"}
+            if ex.closed:
+                self._last_exchange_check[pos["trade_id"]] = 0   # let the monitor reconcile the exit now
+                return {"ok": None, "detail": f"protection executed: position closed on exchange ({ex.reason})"}
+            inc = self.state.incident("protection_missing", "critical", {"trade_id": pos["trade_id"], **res})
+            self.log("protection_missing", f"Exchange protection invalid for {pos['symbol']}: {res.get('detail')} "
+                     f"- re-placing (incident #{inc})", pos["trade_id"], res, "error")
+            try:
+                await broker.cancel_protection(pos)
+            except Exception:  # noqa: BLE001
+                pass
+            # keep the old version number so the replacement gets new client ids
+            old = loads(pos.get("protection")) or {}
+            self.db.execute("UPDATE positions SET protection=? WHERE trade_id=?",
+                            (dumps({"version": old.get("version", 1), "replaced": True}), pos["trade_id"]))
+            fresh = self.db.one("SELECT * FROM positions WHERE trade_id=?", (pos["trade_id"],))
+            await self._protect(fresh, broker)
+        return res
 
     # --------------------------------------------------------- recovery
+    async def paper_downtime_reconcile(self) -> list[str]:
+        """Paper stops/targets only exist while this process runs. After
+        downtime, replay 1-minute candles since the last heartbeat and apply
+        any stop/target that WOULD have triggered (as exchange-side orders
+        would have done): stop assumed first when both touched in one minute,
+        stop fills at the level minus configured slippage, never better."""
+        notes = []
+        # last moment the monitor is known to have run: heartbeat, else the last recorded activity
+        hb = float(self.db.meta_get("executor_heartbeat") or self.db.scalar("SELECT MAX(ts) FROM agent_events") or 0)
+        for p in self.db.all("SELECT * FROM positions WHERE mode='paper' AND status='OPEN'"):
+            since = max(hb, p["opened_at"])
+            if time.time() - since < 90:
+                continue
+            ad = self.md.adapters[p["market"]]
+            rows, start = [], int(since * 1000) // 60_000 * 60_000
+            try:
+                while True:
+                    chunk = await ad.klines(p["symbol"], "1m", limit=1000, start_time=start)
+                    rows += [r for r in chunk if int(r[6]) < time.time() * 1000]
+                    if len(chunk) < 1000:
+                        break
+                    start = int(chunk[-1][0]) + 60_000
+            except Exception as e:  # noqa: BLE001
+                notes.append(f"{p['trade_id']}: downtime candles unavailable ({e}); position left open for live monitoring")
+                continue
+            long = p["direction"] == "LONG"
+            stop, target = D(p["stop_price"]), D(p["target_price"])
+            slip = D(self.cfg.fees.paper_extra_slippage_bps) / D(10_000)
+            hit = None
+            for r in rows:
+                hi, lo, op = D(r[2]), D(r[3]), D(r[1])
+                if (long and lo <= stop) or (not long and hi >= stop):
+                    lvl = min(stop, op) if long else max(stop, op)          # gap through the stop fills at the open
+                    hit = ("stop_loss", lvl * (1 - slip) if long else lvl * (1 + slip), int(r[0]))
+                    break
+                if (long and hi >= target) or (not long and lo <= target):
+                    hit = ("take_profit", target, int(r[0]))
+                    break
+            mins = round((time.time() - since) / 60)
+            if not hit:
+                notes.append(f"{p['trade_id']} {p['symbol']}: unmonitored {mins} min; neither stop nor target touched "
+                             f"in {len(rows)} 1m candles; monitoring resumes")
+                continue
+            reason, px, t_ms = hit
+            fee_rate = D(self.cfg.fees.spot_maker if (reason == "take_profit" and p["market"] == "spot")
+                         else (self.cfg.fees.spot_taker if p["market"] == "spot" else self.cfg.fees.futures_taker))
+            fee = D(p["qty"]) * px * fee_rate
+            cur = self.db.execute("UPDATE positions SET status='CLOSING' WHERE trade_id=? AND status='OPEN'", (p["trade_id"],))
+            if cur.rowcount != 1:
+                continue
+            meta = {"reason": reason, "venue": "paper", "trigger_source": "1m candle replay after downtime",
+                    "trigger_minute_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime(t_ms / 1000)),
+                    "unmonitored_minutes": mins, "level": str(stop if reason == "stop_loss" else target),
+                    "fill": str(px), "slippage_vs_level_bps": float(((stop - px) if long else (px - stop)) / stop * 10_000)
+                    if reason == "stop_loss" else 0.0}
+            n = int(self.db.scalar("SELECT COUNT(*) FROM orders WHERE trade_id=? AND purpose='exit'", (p["trade_id"],)) or 0)
+            cid = client_order_id(p["trade_id"], "X", n)
+            self._order_row(cid, p, "SELL" if long else "BUY", D(p["qty"]), "exit")
+            from ..exchange.broker import ExecResult
+            res = ExecResult("FILLED", D(p["qty"]), px, fee, px, exchange_id=f"PAPER-REPLAY-{cid}",
+                             raw={"simulated": True, "downtime_replay": True})
+            self._update_order(cid, res)
+            self._apply_exit(p, D(p["qty"]), px, fee, f"{reason}_during_downtime", ZERO, cid, res, meta)
+            notes.append(f"{p['trade_id']} {p['symbol']}: {reason} touched at {meta['trigger_minute_utc']} UTC while "
+                         f"unmonitored ({mins} min); exit recorded at {px:.6g}")
+            self.state.incident("paper_downtime_exit", "high", {"trade_id": p["trade_id"], **meta})
+        return notes
+
     async def recover(self) -> list[str]:
         """Startup reconciliation. Returns human-readable notes."""
         notes = []
+        try:
+            notes += await self.paper_downtime_reconcile()
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"paper downtime reconciliation failed: {e}")
         for t in self.db.all("SELECT * FROM trades WHERE stage='EXECUTING'"):
             cid = client_order_id(t["id"], "E")
             order = self.db.one("SELECT * FROM orders WHERE client_id=?", (cid,))

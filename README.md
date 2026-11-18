@@ -14,7 +14,7 @@ SCANNER → RUG CHECK → SIZER → CENTRAL RISK → EXECUTOR → LOGGER → EQU
 # backend (Python ≥ 3.11)
 cd backend
 pip install -r requirements.txt
-python -m pytest -q                      # 69 tests (43 marked "safety")
+python -m pytest -q                      # 86 tests (54 marked "safety")
 
 # frontend
 cd ../frontend
@@ -37,6 +37,8 @@ For frontend development, run `npm run dev` in `frontend/`. It proxies `/api` an
 | `python -m grokbot.testnet_validate --market both [--pipeline]` | Binance **testnet** validation with recorded exchange responses. See `docs/TESTNET.md` |
 | `python -m grokbot.audit [--mode paper]` | Independent recomputation of balances, fees, margin, liquidation and P&L from fills and the ledger |
 | `python -m grokbot.paper_report` | Paper-session evidence report from the database |
+| `python -m grokbot.session_end --policy report\|cancel_pending\|close_all` | End-of-test procedure: reconcile with the exchange, verify protection, report exposure, apply the cleanup policy (never closes blindly), and state the remaining positions and orders |
+| `python -m grokbot.testnet_validate --check` | Testnet preflight (prerequisites only; places nothing) |
 | `python -m grokbot.paper_validation` | Operator **validation** trades (labelled, not strategy signals) through the unchanged pipeline in paper mode, to observe stop-loss/take-profit on real prices |
 
 ### Documentation
@@ -45,6 +47,7 @@ For frontend development, run `npm run dev` in `frontend/`. It proxies `/api` an
 * `docs/STRATEGY_RESEARCH.md`: why the strategies underperform. `docs/strategy_report.md`: full walk-forward tables.
 * `docs/paper_session_report.md`: end-to-end paper-trading evidence.
 * `docs/AUDIT.md`: financial and security audit.
+* `docs/PHASE2_1_REPORT.md`: ETH stop investigation, open-position resolution, testnet lifecycle validation.
 
 ### Environment variables
 

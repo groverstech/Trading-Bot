@@ -402,3 +402,8 @@ pre.json { margin: 0; padding: 10px; background: var(--bg); border: 1px solid va
   .panel-h > span.dim, .panel-h > span.mono.dim { display: none; }
 }
 @media (max-width: 1500px) { .brand small { display: none; } }
+
+/* drawers scroll; their panels keep their natural height (no clipping) */
+.drawer-b > .panel, .drawer-b > .grid-2, .drawer-b .grid-2 > .panel { flex-shrink: 0; }
+.drawer-b .panel { overflow: visible; min-height: auto; }
+.content > .panel, .content > .grid-2:not([style*="height"]) > .panel, .content > .grid-3 > .panel { flex-shrink: 0; }

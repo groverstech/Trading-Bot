@@ -100,11 +100,20 @@ def render(db: Database, mode: str = "paper") -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default=None)
+    ap.add_argument("--db", action="append", help="database path (repeatable)")
+    ap.add_argument("--title", action="append", help="section title per --db")
+    ap.add_argument("--preface", default=None, help="markdown file inserted at the top")
     ap.add_argument("--out", default=str(Path(__file__).resolve().parents[2] / "docs" / "paper_session_report.md"))
     a = ap.parse_args()
-    db = Database(a.db or load_settings().db_path)
-    Path(a.out).write_text(render(db))
+    dbs = a.db or [str(load_settings().db_path)]
+    titles = a.title or [None] * len(dbs)
+    parts = [Path(a.preface).read_text()] if a.preface else []
+    for path, title in zip(dbs, titles):
+        md = render(Database(path))
+        if title:
+            md = md.replace("# Paper-trading session evidence", f"# {title}", 1)
+        parts.append(md)
+    Path(a.out).write_text("\n\n---\n\n".join(parts))
     print("wrote", a.out)
 
 

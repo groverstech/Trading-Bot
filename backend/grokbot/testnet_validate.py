@@ -45,7 +45,9 @@ TRANSPORT = None  # tests inject a mock transport here
 
 
 def _client(base, market, key=None, secret=None):
-    return BinanceClient(base, market, key, secret, transport=TRANSPORT)
+    from .endpoints import require
+    require(base, "testnet", "harness endpoint")       # the harness never talks to production
+    return BinanceClient(base, market, key, secret, transport=TRANSPORT, env="testnet" if key else None)
 
 
 def _scrub(o):
@@ -94,7 +96,103 @@ def accepts_error(fn):
     return fn
 
 
-async def run_market(market: str, symbol: str, key: str | None, secret: str | None) -> list[dict]:
+BASELINES: dict[str, dict] = {}
+RUN: dict = {"steps": [], "metrics": {}, "interrupted": False, "guard": {}}
+
+
+def _uid(prefix: str) -> str:
+    import secrets
+    return f"{prefix}{int(time.time() * 1000)}{secrets.token_hex(2)}"[:36]
+
+
+def _data_dir() -> Path:
+    d = Path(os.environ.get("GROK_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _save_baselines() -> None:
+    (_data_dir() / "testnet_baseline.json").write_text(json.dumps(BASELINES))
+
+
+async def emergency_cleanup(market: str, symbol: str, key: str, secret: str, base0: str) -> dict:
+    """Bring the TEST account back to its pre-run state for `symbol`: cancel open
+    (algo) orders and flatten only exposure created by the run. Verifies the
+    result. Used after normal completion AND after any failure/interruption."""
+    base = SPOT if market == "spot" else FUT
+    pub, tc = _client(base, market), _client(base, market, key, secret)
+    ad = SpotAdapter(pub, tc) if market == "spot" else FuturesAdapter(pub, tc)
+    out: dict = {"market": market, "symbol": symbol, "actions": []}
+    try:
+        if market == "futures":
+            algo = await ad.open_conditionals(symbol)
+            for o in (algo if isinstance(algo, list) else algo.get("orders", [])):
+                await ad.cancel_conditional(o["clientAlgoId"])
+                out["actions"].append(f"cancelled algo order {o['clientAlgoId']}")
+            for o in await ad.open_orders(symbol):
+                await ad.cancel_order(symbol, o["clientOrderId"])
+                out["actions"].append(f"cancelled order {o['clientOrderId']}")
+            amt = sum((Decimal(p["positionAmt"]) for p in await ad.position_risk(symbol)), Decimal(0))
+            if amt != 0:
+                r = await ad.new_order(symbol=symbol, side="SELL" if amt > 0 else "BUY", type="MARKET",
+                                       quantity=fmt(abs(amt)), reduceOnly="true",
+                                       newClientOrderId=_uid("GBVX"))
+                out["actions"].append(f"flattened {amt} ({r.get('status')})")
+            amt = sum((Decimal(p["positionAmt"]) for p in await ad.position_risk(symbol)), Decimal(0))
+            left = await ad.open_orders(symbol)
+            algo = await ad.open_conditionals(symbol)
+            algo = algo if isinstance(algo, list) else algo.get("orders", [])
+            out.update(position_amt=str(amt), open_orders=len(left), open_algo_orders=len(algo),
+                       clean=amt == 0 and not left and not algo)
+        else:
+            for o in await ad.open_orders(symbol):     # cancelling an OCO leg cancels the whole list
+                try:
+                    await ad.cancel_order(symbol, o["clientOrderId"])
+                    out["actions"].append(f"cancelled order {o['clientOrderId']}")
+                except BinanceError:
+                    pass
+            rules = (await ad.exchange_info([symbol]))[symbol]
+            acct = await ad.account()
+            b = next((x for x in acct["balances"] if x["asset"] == rules.base), {"free": "0", "locked": "0"})
+            delta = rules.round_qty(Decimal(b["free"]) + Decimal(b["locked"]) - Decimal(base0), market_order=False)
+            px = Decimal((await ad.book_ticker([symbol]))[0]["bidPrice"])
+            if delta > 0 and delta * px >= rules.min_notional:
+                r = await ad.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=fmt(delta),
+                                       newClientOrderId=_uid("GBVX"))
+                out["actions"].append(f"sold run-created {delta} {rules.base} ({r.get('status')})")
+                acct = await ad.account()
+                b = next((x for x in acct["balances"] if x["asset"] == rules.base), {"free": "0", "locked": "0"})
+                delta = rules.round_qty(Decimal(b["free"]) + Decimal(b["locked"]) - Decimal(base0), market_order=False)
+            left = await ad.open_orders(symbol)
+            out.update(residual_base=str(delta), open_orders=len(left),
+                       clean=not left and (delta <= 0 or delta * px < rules.min_notional),
+                       note="spot residual below the exchange minimum (dust) cannot be sold" if 0 < delta * px < rules.min_notional else "")
+    except Exception as ex:  # noqa: BLE001
+        out.update(clean=False, error=f"{type(ex).__name__}: {ex}")
+    finally:
+        await tc.close()
+        await pub.close()
+    return out
+
+
+async def guard() -> dict:
+    """Runs after every harness run, however it ended."""
+    res = {}
+    for m, b in BASELINES.items():
+        key, sec = os.environ.get(f"GROK_TESTNET_{m.upper()}_KEY"), os.environ.get(f"GROK_TESTNET_{m.upper()}_SECRET")
+        if not key:
+            continue
+        res[m] = await emergency_cleanup(m, b["symbol"], key, sec, b.get("base0", "0"))
+    marker = _data_dir() / "LEFTOVER_EXPOSURE.json"
+    if any(not r.get("clean") for r in res.values()):
+        marker.write_text(json.dumps(res, default=str, indent=1))
+    elif marker.exists():
+        marker.unlink()
+    return res
+
+
+async def run_market(market: str, symbol: str, key: str | None, secret: str | None,
+                     trigger_wait: float = 10.0) -> list[dict]:
     base = SPOT if market == "spot" else FUT
     rec = Recorder(market)
     pub = _client(base, market)
@@ -181,6 +279,35 @@ async def run_market(market: str, symbol: str, key: str | None, secret: str | No
         await rec.step("commission rates", lambda: tad.commission(symbol), lambda r: (True, json.dumps(r)[:80]))
         ustream_task = asyncio.create_task(_user_stream(tc, user_events))
 
+    # ---- baseline + refusal to touch pre-existing exposure ----
+    async def baseline():
+        out = {}
+        if market == "spot":
+            bal = await _spot_bal(tad, {}, extra=(st["rules"].base,))
+            b = bal.get(st["rules"].base, {})
+            st["base0"] = Decimal(b.get("free", "0")) + Decimal(b.get("locked", "0"))
+            oo = [o for o in await tad.open_orders(symbol)]
+            out = {"base_asset": st["rules"].base, "base_balance_at_start": str(st["base0"]), "open_orders": len(oo)}
+            out["clean"] = not oo
+        else:
+            pr = await tad.position_risk(symbol)
+            amt = sum((Decimal(p["positionAmt"]) for p in pr), Decimal(0))
+            oo = await tad.open_orders(symbol)
+            algo = await tad.open_conditionals(symbol)
+            algo = algo if isinstance(algo, list) else algo.get("orders", [])
+            out = {"position_amt": str(amt), "open_orders": len(oo), "open_algo_orders": len(algo)}
+            out["clean"] = amt == 0 and not oo and not algo
+        BASELINES[market] = {"symbol": symbol, "base0": str(st.get("base0", "0")), "tag": tag}
+        _save_baselines()
+        return out
+    r0 = await rec.step(f"baseline: no pre-existing {symbol} position / open orders (the harness never touches existing exposure)",
+                        baseline, lambda r: (r["clean"], json.dumps(r)))
+    if r0["status"] != "PASS":
+        rec.skip("order lifecycle steps", f"pre-existing exposure on {symbol}: refusing to trade it (close it on the "
+                 "testnet UI or use another --symbol)")
+        await tc.close()
+        await pub.close()
+        return rec.steps
     px = Decimal(str(st["bid"]))
     min_notional = max(rules.min_notional, Decimal("10"))
     qty = rules.round_qty((min_notional * Decimal("1.5")) / px, market_order=False)
@@ -210,55 +337,81 @@ async def run_market(market: str, symbol: str, key: str | None, secret: str | No
                    lambda r: (r["status"] == "CANCELED", f"final status {r['status']}"))
 
     mcid = f"{tag}-E"
-    await rec.step(f"market order + fills/commission via broker (BUY {qty})",
-                   lambda: _res(broker.market_order(market, symbol, "BUY", qty, mcid)),
-                   lambda r: (r["status"] == "FILLED" and Decimal(r["filled_qty"]) > 0,
-                              f"avg {r['avg_price']}, fee {r['fee_usdt']} USDT, net qty {r['net_base_qty']}"))
-    held = None
-    q = await tad.query_order(symbol, mcid)
-    st["entry_avg"] = Decimal(q.get("avgPrice") or "0") or (Decimal(q.get("cummulativeQuoteQty", "0")) / Decimal(q["executedQty"]))
-    if market == "spot":
-        bal = await _spot_bal(tad, {})
-        held = rules.round_qty(min(Decimal(bal.get(rules.base, {}).get("free", "0")), Decimal(q["executedQty"])), market_order=False)
-    else:
-        held = Decimal(q["executedQty"])
+    base_asset = rules.base
+
+    async def held_delta() -> Decimal:
+        """Exposure created by THIS run only (spot: base balance above the start baseline)."""
+        if market == "spot":
+            bal = await _spot_bal(tad, {}, extra=(base_asset,))
+            b = bal.get(base_asset, {})
+            cur = Decimal(b.get("free", "0")) + Decimal(b.get("locked", "0"))
+            return rules.round_qty(max(Decimal(0), cur - st["base0"]), market_order=False)
+        pr = await tad.position_risk(symbol)
+        return sum((Decimal(p["positionAmt"]) for p in pr), Decimal(0))
+
+    async def flatten(note: str) -> dict:
+        """Close only what this run created; never sells pre-existing holdings."""
+        if market == "spot":
+            q = await held_delta()
+            if q > 0 and q * px >= rules.min_notional:
+                return await _res(broker.market_order(market, symbol, "SELL", q, _uid(f"{tag}-F")))
+            return {"status": "NOTHING_TO_FLATTEN", "note": note, "residual": str(q)}
+        amt = await held_delta()
+        if amt != 0:
+            return await _res(broker.market_order(market, symbol, "SELL" if amt > 0 else "BUY", abs(amt),
+                                                  _uid(f"{tag}-F"), reduce_only=True))
+        return {"status": "NOTHING_TO_FLATTEN", "note": note}
 
     pcid = f"{tag}-P"
+
     async def partial():
         book = await ad.depth(symbol, 5)
         best_ask, best_qty = Decimal(book["asks"][0][0]), Decimal(book["asks"][0][1])
-        want = rules.round_qty(min(best_qty * 3, qty * 4), market_order=False)
-        want = max(want, qty)
+        want = max(rules.round_qty(min(best_qty * 3, qty * 4), market_order=False), qty)
         r = await tad.new_order(symbol=symbol, side="BUY", type="LIMIT", timeInForce="GTC", quantity=fmt(want),
                                 price=fmt(best_ask), newClientOrderId=pcid)
-        st["partial_req"] = {"qty": str(want), "price": str(best_ask), "top_ask_qty": str(best_qty)}
         await asyncio.sleep(1.5)
         r2 = await tad.query_order(symbol, pcid)
         final = await _res(broker.cancel_order(market, symbol, pcid))
-        return {"request": st["partial_req"], "initial": r.get("status"), "after_1.5s": r2.get("status"),
-                "executed": r2.get("executedQty"), "final": final}
-    await rec.step("partial-fill probe (marketable limit larger than top-of-book, remainder cancelled)", partial,
-                   lambda r: (r["final"]["status"] in ("CANCELED", "FILLED"),
-                              f"observed {r['after_1.5s']} executed {r['executed']} → {r['final']['status']}"), critical=False)
-    if market == "spot":
-        bal = await _spot_bal(tad, {})
-        held = rules.round_qty(Decimal(bal.get(rules.base, {}).get("free", "0")), market_order=False)
-    else:
-        pr = await tad.position_risk(symbol)
-        held = abs(sum(Decimal(p["positionAmt"]) for p in pr))
+        fl = await flatten("partial-fill probe")       # self-contained: nothing left behind, unprotected or not
+        return {"request": {"qty": str(want), "price": str(best_ask), "top_ask_qty": str(best_qty)},
+                "initial": r.get("status"), "after_1.5s": r2.get("status"), "executed": r2.get("executedQty"),
+                "final": final, "flattened": fl}
+    await rec.step("partial-fill probe (marketable limit larger than top-of-book; remainder cancelled; fill flattened)",
+                   partial, lambda r: (r["final"]["status"] in ("CANCELED", "FILLED"),
+                                       f"observed {r['after_1.5s']} executed {r['executed']} → {r['final']['status']}; "
+                                       f"flatten {r['flattened']['status']}"), critical=False)
 
-    pos = {"trade_id": tag, "market": market, "symbol": symbol, "direction": "LONG", "qty": str(held),
-           "stop_price": str(st["entry_avg"] * Decimal("0.97")), "target_price": str(st["entry_avg"] * Decimal("1.03")),
-           "opened_at": time.time() - 120, "protection": None}
-    await rec.step("stop-loss + take-profit placement via broker (Spot OCO / Futures Algo)",
-                   lambda: _place(broker, pos), lambda r: (bool(r.get("type")), json.dumps(r)))
+    pos = {"trade_id": tag, "market": market, "symbol": symbol, "direction": "LONG", "qty": "0",
+           "stop_price": "0", "target_price": "0", "opened_at": time.time() - 120, "protection": None}
+
+    async def enter_protected():
+        """Market entry and exchange-side protection in ONE step: no unprotected window
+        beyond the round-trip of the protection request; if protection fails, flatten."""
+        r = await _res(broker.market_order(market, symbol, "BUY", qty, mcid))
+        q = await tad.query_order(symbol, mcid)
+        st["entry_avg"] = Decimal(q.get("avgPrice") or "0") or (Decimal(q.get("cummulativeQuoteQty", "0")) / Decimal(q["executedQty"]))
+        held = await held_delta()
+        pos.update(qty=str(abs(held)), stop_price=str(st["entry_avg"] * Decimal("0.97")),
+                   target_price=str(st["entry_avg"] * Decimal("1.03")))
+        try:
+            prot = await _place(broker, pos)
+        except Exception as ex:  # noqa: BLE001
+            fl = await flatten("protection failed")
+            raise RuntimeError(f"protection placement failed ({ex}); position flattened: {fl.get('status')}") from ex
+        return {**r, "held": str(held), "protection": prot}
+    await rec.step(f"market order + fill + IMMEDIATE exchange-side SL/TP (BUY {qty})", enter_protected,
+                   lambda r: (r["status"] == "FILLED" and bool(r["protection"].get("type")),
+                              f"avg {r['avg_price']}, fee {r['fee_usdt']} USDT, held {r['held']}, protection {r['protection'].get('type')}"))
     if market == "spot":
-        await rec.step("protection query (order list)", lambda: tad.query_order_list(pos["_lid"]),
+        await rec.step("protection query (order list)", lambda: tad.query_order_list(pos.get("_lid") or "-"),
                        lambda r: (r.get("listOrderStatus") in ("EXECUTING", "EXEC_STARTED"), f"listOrderStatus {r.get('listOrderStatus')}"))
     else:
         await rec.step("protection query (open algo orders)", lambda: tad.open_conditionals(symbol),
                        lambda r: (len([x for x in (r if isinstance(r, list) else r.get("orders", [])) if str(x.get("clientAlgoId", "")).startswith(tag)]) == 2,
                                   f"{len(r) if isinstance(r, list) else r}"))
+    await rec.step("protection verified by broker.verify_protection", lambda: broker.verify_protection(pos),
+                   lambda r: (bool(r.get("ok")), r.get("detail", "")))
     await rec.step("position reconciliation via broker.check_exit (expect still open)",
                    lambda: _exit(broker, pos), lambda r: (r["closed"] is False, json.dumps(r)))
     if market == "futures":
@@ -273,15 +426,29 @@ async def run_market(market: str, symbol: str, key: str | None, secret: str | No
                        lambda r: (Decimal(r["ours_estimate"]) >= Decimal(r["binance_liquidation"]) * Decimal("0.995"),
                                   f"binance {r['binance_liquidation']} vs ours {r['ours_estimate']} (ours should be ≥, i.e. conservative)"),
                        critical=False)
-    await rec.step("cancel protection via broker", lambda: _cancel_prot(broker, pos), lambda r: (True, "cancelled"))
-    xcid = f"{tag}-X"
-    await rec.step(f"flatten: market SELL {held} via broker (reduce-only on futures)",
-                   lambda: _res(broker.market_order(market, symbol, "SELL", held, xcid, reduce_only=True)),
-                   lambda r: (r["status"] in ("FILLED", "PARTIALLY_FILLED"), f"avg {r['avg_price']} fee {r['fee_usdt']}"))
+
+    async def exit_and_unprotect():
+        if market == "futures":           # flatten FIRST (closePosition orders keep protecting until then)
+            fl = await flatten("planned exit")
+            await broker.cancel_protection(pos)
+        else:                             # spot OCO locks the balance: cancel, then sell immediately
+            await broker.cancel_protection(pos)
+            fl = await flatten("planned exit")
+        return fl
+    await rec.step("planned exit: flatten + remove protection (no unprotected interval on futures)", exit_and_unprotect,
+                   lambda r: (r["status"] in ("FILLED", "PARTIALLY_FILLED"), f"avg {r.get('avg_price')} fee {r.get('fee_usdt')}"))
     if market == "futures":
         await rec.step("position reconciliation after flatten (positionAmt == 0)",
                        lambda: tad.position_risk(symbol),
                        lambda r: (sum(Decimal(p["positionAmt"]) for p in r) == 0, "flat"))
+
+    # ---- exchange-triggered protection: one TAKE-PROFIT test and one STOP-LOSS test ----
+    for kind in ("take_profit", "stop_loss"):
+        await rec.step(f"EXCHANGE-TRIGGERED {kind.replace('_', '-').upper()}: tight level, wait ≤{trigger_wait:g} min "
+                       "for the exchange to execute it", lambda kind=kind: _trigger_test(
+                           kind, market, symbol, tad, ad, broker, rules, qty, tag, held_delta, flatten, trigger_wait),
+                       lambda r: (r["result"] in ("TRIGGERED", "NOT_TRIGGERED") and r["flat_after"],
+                                  r["summary"]), critical=False)
     await rec.step("trade history (my trades / user trades)",
                    lambda: (tad.my_trades(symbol, start_time=int((time.time() - 600) * 1000)) if market == "spot"
                             else tad.user_trades(symbol, start_time=int((time.time() - 600) * 1000))),
@@ -303,6 +470,80 @@ async def run_market(market: str, symbol: str, key: str | None, secret: str | No
     return rec.steps
 
 
+async def _trigger_test(kind, market, symbol, tad, ad, broker, rules, qty, tag, held_delta, flatten, wait_min):
+    """Open a minimum LONG, protect it with one level a few bps from the market
+    (TP test: target close / stop far; SL test: stop close / target far) and let
+    the EXCHANGE execute it. Detect via broker.check_exit (the same code the
+    Executor uses), report fill vs level, and always end flat."""
+    out = {"kind": kind, "result": None, "attempts": [], "flat_after": False}
+    cid = f"{tag}-{'T' if kind == 'take_profit' else 'S'}"
+    try:
+        await broker.market_order(market, symbol, "BUY", qty, f"{cid}E")
+        held = abs(await held_delta())
+        out["held"] = str(held)
+        for attempt, bps in enumerate((Decimal("5"), Decimal("10"), Decimal("20")), 1):
+            if market == "futures":
+                ref = Decimal(next(p for p in await ad.premium_index_all() if p["symbol"] == symbol)["markPrice"])
+            else:
+                bt = (await ad.book_ticker([symbol]))[0]
+                ref = Decimal(bt["askPrice"]) if kind == "take_profit" else Decimal(bt["bidPrice"])
+            near, far = bps / Decimal(10_000), Decimal("0.01")
+            if kind == "take_profit":
+                target, stop = ref * (1 + near), ref * (1 - far)
+            else:
+                stop, target = ref * (1 - near), ref * (1 + far)
+            pos = {"trade_id": f"{cid}{attempt}", "market": market, "symbol": symbol, "direction": "LONG",
+                   "qty": str(held), "stop_price": str(rules.round_price(stop)), "target_price": str(rules.round_price(target)),
+                   "opened_at": time.time() - 5, "protection": None}
+            try:
+                info = await _place(broker, pos)
+                out["attempts"].append({"offset_bps": str(bps), "ref": str(ref), "stop": pos["stop_price"],
+                                        "target": pos["target_price"], "placed": info})
+                break
+            except BinanceError as ex:   # e.g. -2021 "would immediately trigger" if price moved through the level
+                out["attempts"].append({"offset_bps": str(bps), "ref": str(ref), "error": f"{ex.code}: {ex.msg}"})
+                pos = None
+        if pos is None:
+            out["result"] = "PLACEMENT_FAILED"
+            return out
+        deadline = time.time() + wait_min * 60
+        ex = None
+        while time.time() < deadline:
+            ex = await broker.check_exit(pos)
+            if ex.closed:
+                break
+            await asyncio.sleep(5)
+        if ex and ex.closed:
+            level = Decimal(pos["target_price"] if kind == "take_profit" else pos["stop_price"])
+            adverse = (level - ex.exit_price) if ex.exit_price else Decimal(0)
+            out.update(result="TRIGGERED", exchange_reason=ex.reason, exit_price=str(ex.exit_price), level=str(level),
+                       fee_usdt=str(ex.fee_usdt), fill_vs_level_bps=float(adverse / level * 10_000) if ex.exit_price else None,
+                       matches_expected=ex.reason == kind)
+        else:
+            out["result"] = "NOT_TRIGGERED"
+            if market == "spot":            # OCO locks the balance: release it before selling
+                await broker.cancel_protection(pos)
+    finally:
+        try:
+            if out.get("result") != "TRIGGERED":
+                fl = await flatten(f"{kind} test cleanup")
+                out["cleanup"] = fl.get("status")
+                if market == "futures" and "pos" in locals() and pos:
+                    await broker.cancel_protection(pos)
+            rem = await held_delta()
+            out["flat_after"] = rem == 0
+            out["residual"] = str(rem)
+        except Exception as e2:  # noqa: BLE001
+            out["cleanup_error"] = str(e2)
+    lvl = out.get("level")
+    out["summary"] = (f"{out['result']}" + (f" by exchange as {out.get('exchange_reason')} at {out.get('exit_price')} vs level {lvl} "
+                      f"({out.get('fill_vs_level_bps', 0):+.1f} bps, + = worse)" if out["result"] == "TRIGGERED" else
+                      " within the window (market did not reach the level; position flattened)" if out["result"] == "NOT_TRIGGERED"
+                      else f" ({out['attempts'][-1].get('error') if out['attempts'] else ''})")
+                      + f"; flat after: {out['flat_after']}")
+    return out
+
+
 async def _const(v):
     return v
 
@@ -317,10 +558,10 @@ async def _res(coro):
             "net_base_qty": str(r.net_base_qty), "exchange_id": r.exchange_id, "error": r.error, "raw": _scrub(r.raw)}
 
 
-async def _spot_bal(ad, st):
+async def _spot_bal(ad, st, extra=()):
     a = await ad.account()
     return {b["asset"]: {"free": b["free"], "locked": b["locked"]} for b in a["balances"]
-            if b["asset"] in ("USDT", "BTC", "ETH", "BNB")}
+            if b["asset"] in ("USDT", "BTC", "ETH", "BNB", *extra)}
 
 
 async def _fut_bal(ad, st):
@@ -359,11 +600,19 @@ async def _user_stream(client, sink):
 
 
 def render(steps: list[dict], meta: dict) -> str:
+    real = meta.get("network", "").startswith("real")
     L = ["# Binance testnet validation report", "",
+         ("> **NATURE OF RESULTS: ACTUAL EXCHANGE RESPONSES** from the Binance **TEST** environment "
+          "(testnet.binance.vision, testnet.binancefuture.com) with test funds. No simulated or paper result appears "
+          "in this report. Signatures and API keys are removed." if real else
+          "> **NATURE OF RESULTS: MOCK EXCHANGE (automated test run). NOT EXCHANGE RESULTS.** This file must never be "
+          "used as evidence of exchange behaviour."), "",
          f"Run {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(meta['ts']))} · symbol {meta['symbol']} · "
-         f"host: {meta['host']}", "",
-         "Only Binance TEST environments are contacted (testnet.binance.vision, testnet.binancefuture.com). "
-         "Responses below are the exchange's actual replies (signatures/keys removed).", ""]
+         f"host: {meta['host']} · network: {meta.get('network')}"
+         + (" · **RUN WAS INTERRUPTED** (end-of-run guard still executed)" if meta.get("interrupted") else ""), "",
+         "Status legend: PASS / FAIL = exchange response met / did not meet the expectation · SKIPPED = not executed "
+         "(reason given) · exchange-triggered SL/TP tests report TRIGGERED or NOT_TRIGGERED (market did not reach "
+         "the level in the window; never counted as a pass of that trigger).", ""]
     for m in ("spot", "futures", "spot-pipeline", "futures-pipeline"):
         ss = [s for s in steps if s["market"] == m]
         if not ss:
@@ -566,103 +815,275 @@ async def account_state(key_s, sec_s, key_f, sec_f) -> dict:
     return out
 
 
-def preflight() -> int:
-    """Check prerequisites without placing anything. Exit code 0 = ready."""
+def preflight(symbol: str = "BTCUSDT", run_tests: bool = True) -> int:
+    """Read-only readiness check. Places NOTHING. Exit code 0 = ready."""
     import importlib
     import re
+    import subprocess
     import sys
-    import urllib.request
-    rows = []
+    rows: list[tuple[str, str, bool | None, str]] = []   # (group, name, ok, detail); ok None = info
 
-    def chk(name, ok, detail):
-        rows.append((name, ok, detail))
-    chk("python >= 3.11", sys.version_info >= (3, 11), sys.version.split()[0])
+    def chk(group, name, ok, detail):
+        rows.append((group, name, ok, detail))
+    # ---- environment
+    chk("environment", "python >= 3.11", sys.version_info >= (3, 11), sys.version.split()[0])
     for mod in ("fastapi", "httpx", "numpy", "cryptography", "websockets", "pydantic"):
         try:
             importlib.import_module(mod)
-            chk(f"module {mod}", True, "installed")
+            chk("environment", f"module {mod}", True, "installed")
         except ImportError:
-            chk(f"module {mod}", False, "pip install -r requirements.txt")
-    chk("GROK_PROFILE=testnet (needed for --pipeline)", os.environ.get("GROK_PROFILE") == "testnet",
-        os.environ.get("GROK_PROFILE") or "not set")
-    for m in ("SPOT", "FUTURES"):
-        k, s_ = os.environ.get(f"GROK_TESTNET_{m}_KEY", ""), os.environ.get(f"GROK_TESTNET_{m}_SECRET", "")
-        fmt_ok = bool(re.fullmatch(r"[A-Za-z0-9]{16,256}", k)) and bool(re.fullmatch(r"[A-Za-z0-9]{16,256}", s_))
-        chk(f"GROK_TESTNET_{m}_KEY/_SECRET", fmt_ok, "present, format OK" if fmt_ok else "missing or malformed")
-    for name, url in (("spot testnet reachable", f"{SPOT}/api/v3/ping"), ("futures testnet reachable", f"{FUT}/fapi/v1/ping")):
-        try:
-            with urllib.request.urlopen(url, timeout=10) as r:
-                chk(name, r.status == 200, f"HTTP {r.status}")
-        except Exception as ex:  # noqa: BLE001
-            chk(name, False, str(ex)[:80])
-    for k in ("GROK_ALLOW_LIVE",):
-        chk("live trading NOT enabled in this shell", os.environ.get(k) != "1", f"{k}={os.environ.get(k, '0')}")
-    for name, ok, detail in rows:
-        print(f"{'OK  ' if ok else 'FAIL'}  {name}: {detail}")
-    bad = [r for r in rows if not r[1]]
-    print(f"\n{len(rows) - len(bad)}/{len(rows)} prerequisites met" + ("" if not bad else " — fix the FAIL lines first"))
+            chk("environment", f"module {mod}", False, "pip install -r requirements.txt")
+    # ---- isolation / safety
+    chk("safety", "GROK_PROFILE=testnet", os.environ.get("GROK_PROFILE") == "testnet", os.environ.get("GROK_PROFILE") or "not set")
+    chk("safety", "GROK_ALLOW_LIVE not set", os.environ.get("GROK_ALLOW_LIVE") != "1", f"GROK_ALLOW_LIVE={os.environ.get('GROK_ALLOW_LIVE', '0')}")
+    try:
+        from .settings import load_settings
+        st_ = load_settings()
+        ep = st_.endpoints
+        chk("safety", "all endpoints validated (testnet profile: data + streams + trading on TESTNET hosts)", True,
+            f"spot {ep.spot_testnet} · futures {ep.futures_testnet} · data {ep.spot_data}, {ep.futures_data}")
+        data_dir = st_.data_dir
+        from .db import Database
+        live_creds = []
+        if st_.db_path.exists():
+            db = Database(st_.db_path)
+            live_creds = [r["id"] for r in db.all("SELECT id FROM credentials WHERE env='live'")]
+            from .config_store import CapitalCfg, ConfigStore, RiskCfg
+            cfg = ConfigStore(db)
+            chk("safety", "initial capital is ₹50,000", cfg.capital.starting_inr == 50000, f"₹{cfg.capital.starting_inr:,.0f}")
+            d, r_ = RiskCfg(), cfg.risk
+            looser = [k for k in ("risk_per_trade_pct", "max_risk_per_trade_pct", "max_daily_loss_pct", "max_drawdown_pct",
+                                  "max_leverage", "max_positions", "max_exposure_pct", "max_correlated_exposure_pct",
+                                  "max_position_pct", "stale_data_seconds", "signal_ttl_seconds")
+                      if getattr(r_, k) > getattr(d, k)] + (["min_reward_risk"] if r_.min_reward_risk < d.min_reward_risk else [])
+            chk("safety", "risk limits not looser than defaults", not looser, ", ".join(looser) or "all at or tighter than defaults")
+            db.close()
+        else:
+            from .config_store import CapitalCfg
+            chk("safety", "initial capital is ₹50,000", CapitalCfg().starting_inr == 50000, "defaults (fresh data dir)")
+        chk("safety", "data dir holds NO live (production) credentials", not live_creds,
+            f"{data_dir}" + (f" contains {live_creds}" if live_creds else ""))
+        chk("safety", "no leftover exposure from a previous run", not (data_dir / "LEFTOVER_EXPOSURE.json").exists(),
+            "LEFTOVER_EXPOSURE.json present: run --cleanup-only" if (data_dir / "LEFTOVER_EXPOSURE.json").exists() else "none")
+    except Exception as ex:  # noqa: BLE001
+        chk("safety", "configuration valid", False, str(ex)[:160])
+    # ---- credentials, connectivity, permissions, account configuration (signed, READ-ONLY)
+    for m in ("spot", "futures"):
+        k, sec = os.environ.get(f"GROK_TESTNET_{m.upper()}_KEY", ""), os.environ.get(f"GROK_TESTNET_{m.upper()}_SECRET", "")
+        fmt_ok = bool(re.fullmatch(r"[A-Za-z0-9]{16,256}", k)) and bool(re.fullmatch(r"[A-Za-z0-9]{16,256}", sec))
+        chk(m, "credentials present (format)", fmt_ok, "present, format OK" if fmt_ok else f"set GROK_TESTNET_{m.upper()}_KEY/_SECRET")
+        for name, ok, detail in asyncio.run(_preflight_market(m, symbol, k if fmt_ok else None, sec if fmt_ok else None)):
+            chk(m, name, ok, detail)
+    # ---- safety test suite
+    if run_tests:
+        root = Path(__file__).resolve().parents[1]
+        clean_env = {k: v for k, v in os.environ.items() if not k.startswith("GROK_")}   # never pass keys to tests
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-m", "safety", "-p", "no:cacheprovider", str(root / "tests")],
+                           cwd=str(root), capture_output=True, text=True, env=clean_env)
+        last = [x for x in r.stdout.strip().splitlines() if x.strip()][-1:] or ["no output"]
+        chk("safety", "automated safety test suite", r.returncode == 0, last[0][:120])
+    group = None
+    for g, name, ok, detail in rows:
+        if g != group:
+            print(f"\n[{g}]")
+            group = g
+        print(f"  {'OK  ' if ok else ('INFO' if ok is None else 'FAIL')}  {name}: {detail}")
+    bad = [r_ for r_ in rows if r_[2] is False]
+    req = [r_ for r_ in rows if r_[2] is not None]
+    print(f"\n{len(req) - len(bad)}/{len(req)} readiness checks passed" + ("" if not bad else " — fix every FAIL before running"))
+    (_data_dir() / "testnet_preflight.json").write_text(json.dumps(
+        [{"group": g, "check": n, "ok": o, "detail": d} for g, n, o, d in rows], indent=1))
     return 1 if bad else 0
 
 
-async def amain(a) -> int:
-    from . import exec_metrics
-    steps: list[dict] = []
-    metrics: dict[str, dict] = {}
-    creds = {m: (os.environ.get(f"GROK_TESTNET_{m.upper()}_KEY"), os.environ.get(f"GROK_TESTNET_{m.upper()}_SECRET"))
-             for m in ("spot", "futures")}
+async def _preflight_market(market: str, symbol: str, key: str | None, secret: str | None) -> list:
+    out = []
+    base = SPOT if market == "spot" else FUT
+    pub = _client(base, market)
+    ad = SpotAdapter(pub) if market == "spot" else FuturesAdapter(pub)
+    try:
+        off = await pub.sync_time()
+        out.append(("testnet reachable + clock offset < 1 s", abs(off) < 1000, f"{base} offset {off} ms"))
+        rules = (await ad.exchange_info([symbol]))[symbol]
+        out.append((f"{symbol} trading on testnet", rules.trading, f"status {rules.status}, min notional {rules.min_notional}"))
+    except Exception as ex:  # noqa: BLE001
+        out.append(("testnet reachable", False, f"{base}: {str(ex)[:120]}"))
+        await pub.close()
+        return out
+    if not key:
+        await pub.close()
+        return out
+    tc = _client(base, market, key, secret)
+    sa = SpotAdapter(pub, tc) if market == "spot" else FuturesAdapter(pub, tc)
+    try:
+        if market == "spot":
+            acct = await sa.account()
+            out.append(("credentials accepted by testnet (signed read)", True, f"accountType {acct.get('accountType')}"))
+            out.append(("trading permission (canTrade)", bool(acct.get("canTrade")), f"canTrade={acct.get('canTrade')}"))
+            perms = acct.get("permissions") or acct.get("permissionSets") or []
+            flat = [p for x in perms for p in (x if isinstance(x, list) else [x])]
+            out.append(("SPOT permission on key/account", "SPOT" in flat or not flat, f"permissions {flat or 'n/a'}"))
+            out.append(("withdraw/transfer capability", None,
+                        f"account canWithdraw={acct.get('canWithdraw')} (testnet funds have no value); the application has "
+                        "NO withdrawal/transfer code and refuses such endpoints by allowlist"))
+            usdt = next((Decimal(b["free"]) for b in acct["balances"] if b["asset"] == "USDT"), Decimal(0))
+            out.append(("test USDT balance sufficient (>= 50)", usdt >= 50, f"USDT free {usdt}"))
+            oo = await sa.open_orders(symbol)
+            out.append((f"no pre-existing open {symbol} orders", not oo, f"{len(oo)} open"))
+        else:
+            acct = await sa.account()
+            out.append(("credentials accepted by testnet (signed read)", True, f"{len(acct.get('assets', []))} assets"))
+            avail = next((Decimal(a["availableBalance"]) for a in acct.get("assets", []) if a["asset"] == "USDT"), Decimal(0))
+            out.append(("test USDT available sufficient (>= 200)", avail >= 200, f"USDT available {avail}"))
+            hedge = await sa.position_mode()
+            out.append(("position mode One-way (required)", not hedge, f"dualSidePosition={hedge}"))
+            try:
+                mam = await tc.request("GET", "/fapi/v1/multiAssetsMargin", signed=True)
+                out.append(("single-asset margin mode", not mam.get("multiAssetsMargin"), f"multiAssetsMargin={mam.get('multiAssetsMargin')}"))
+            except BinanceError as ex:
+                out.append(("single-asset margin mode", None, f"not checkable: {ex.msg}"))
+            pr = await sa.position_risk(symbol)
+            amt = sum((Decimal(p["positionAmt"]) for p in pr), Decimal(0))
+            oo = await sa.open_orders(symbol)
+            algo = await sa.open_conditionals(symbol)
+            algo = algo if isinstance(algo, list) else algo.get("orders", [])
+            out.append((f"no pre-existing {symbol} position / orders / algo orders", amt == 0 and not oo and not algo,
+                        f"positionAmt {amt}, {len(oo)} orders, {len(algo)} algo orders"))
+            out.append(("withdraw/transfer capability", None,
+                        "testnet futures keys cannot be inspected via /sapi; the application has NO withdrawal/transfer "
+                        "code and refuses such endpoints by allowlist"))
+    except BinanceError as ex:
+        out.append(("credentials accepted by testnet (signed read)", False, f"{ex.code}: {ex.msg} (production keys are rejected by testnet)"))
+    except Exception as ex:  # noqa: BLE001
+        out.append(("signed read-only checks", False, str(ex)[:160]))
+    finally:
+        await tc.close()
+        await pub.close()
+    return out
+
+
+async def amain(a) -> None:
+    """Runs the checks, appending to RUN as it goes so an interruption keeps what was done."""
     for m in (["spot", "futures"] if a.market == "both" else [a.market]):
-        key, sec = creds[m]
-        steps += await run_market(m, a.symbol, key, sec)
+        key, sec = os.environ.get(f"GROK_TESTNET_{m.upper()}_KEY"), os.environ.get(f"GROK_TESTNET_{m.upper()}_SECRET")
+        RUN["steps"] += await run_market(m, a.symbol, key, sec, trigger_wait=a.trigger_wait)
+        if a.pipeline and key and m not in BASELINES:
+            RUN["steps"].append({"market": f"{m}-pipeline", "step": "application lifecycle", "status": "SKIPPED",
+                                 "note": "baseline not established (unreachable or pre-existing exposure): not trading",
+                                 "ts": time.time()})
+            continue
         if a.pipeline:
             ps, mt = await run_pipeline(m, a.symbol, key, sec, direction="LONG" if m == "spot" else a.direction,
-                                        wait_minutes=a.wait_minutes,
-                                        cleanup=a.cleanup, db_dir=os.path.join(os.environ.get("GROK_DATA_DIR", "data"),
-                                                                               f"testnet-pipeline-{m}"))
-            steps += ps
+                                        wait_minutes=a.wait_minutes, cleanup=a.cleanup,
+                                        db_dir=str(_data_dir() / f"testnet-pipeline-{m}"))
+            RUN["steps"] += ps
             if mt:
-                metrics[m] = mt
+                RUN["metrics"][m] = mt
+
+
+async def finish(a) -> int:
+    """ALWAYS runs (normal end, error or interruption): guard cleanup, final
+    account state straight from the exchange, report."""
+    from . import exec_metrics
+    RUN["guard"] = await guard()
+    creds = {m: (os.environ.get(f"GROK_TESTNET_{m.upper()}_KEY"), os.environ.get(f"GROK_TESTNET_{m.upper()}_SECRET"))
+             for m in ("spot", "futures")}
     acct = await account_state(*creds["spot"], *creds["futures"]) if any(k for k, _ in creds.values()) else \
         {"statement": "No testnet credentials supplied: no test account was queried and no order was placed."}
+    real = TRANSPORT is None
     meta = {"ts": time.time(), "symbol": a.symbol, "host": os.uname().nodename, "pipeline": a.pipeline,
-            "cleanup": a.cleanup, "wait_minutes": a.wait_minutes}
-    root = Path(__file__).resolve().parents[2]
-    (root / "docs").mkdir(exist_ok=True)
+            "cleanup": a.cleanup, "wait_minutes": a.wait_minutes, "trigger_wait": a.trigger_wait,
+            "interrupted": RUN["interrupted"], "network": "real Binance TEST network" if real else "MOCK exchange (automated test)"}
+    steps = RUN["steps"]
     md = render(steps, meta)
     md += "\n## Exchange execution metrics (testnet application pipeline)\n\n"
-    md += ("\n".join(exec_metrics.render(v, f"{k} pipeline") for k, v in metrics.items()) if metrics else
-           "_Not available: the application pipeline did not run (no credentials or GROK_PROFILE not testnet)._\n")
-    md += f"\n## Final test-account state\n\n**{acct['statement']}**\n\n```json\n{json.dumps(acct, indent=1, default=str)[:3000]}\n```\n"
-    (root / "docs" / "testnet_report.md").write_text(md)
-    out = Path(os.environ.get("GROK_DATA_DIR", root / "data"))
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "testnet_report.json").write_text(json.dumps({"meta": meta, "steps": steps, "metrics": metrics,
-                                                         "account": acct}, default=str, indent=1))
-    fails = [s for s in steps if s["status"] == "FAIL" and s.get("critical", True)]
+    md += ("\n".join(exec_metrics.render(v, f"{k} pipeline") for k, v in RUN["metrics"].items()) if RUN["metrics"] else
+           "_Not available: the application pipeline did not run (no credentials, GROK_PROFILE not testnet, or interrupted)._\n")
+    md += "\n## End-of-run guard (always executed)\n\n"
+    if RUN["guard"]:
+        for m, g in RUN["guard"].items():
+            md += (f"* **{m}**: {'CLEAN' if g.get('clean') else 'NOT CLEAN — see LEFTOVER_EXPOSURE.json'}; actions: "
+                   f"{'; '.join(g.get('actions', [])) or 'none needed'}"
+                   + (f"; error: {g['error']}" if g.get("error") else "") + "\n")
+    else:
+        md += "* No exchange exposure was created by this run.\n"
+    md += f"\n## Final test-account state (queried from the exchange)\n\n**{acct['statement']}**\n\n```json\n{json.dumps(acct, indent=1, default=str)[:3000]}\n```\n"
+    if real:   # never let a mock run overwrite the real report
+        root = Path(__file__).resolve().parents[2]
+        (root / "docs").mkdir(exist_ok=True)
+        (root / "docs" / "testnet_report.md").write_text(md)
+    (_data_dir() / "testnet_report.json").write_text(json.dumps({"meta": meta, "steps": steps, "metrics": RUN["metrics"],
+                                                                 "guard": RUN["guard"], "account": acct}, default=str, indent=1))
+    (_data_dir() / "testnet_report.md").write_text(md)
+    fails = [x for x in steps if x["status"] == "FAIL" and x.get("critical", True)]
+    unclean = [m for m, g in RUN["guard"].items() if not g.get("clean")]
     print(f"\n{acct['statement']}")
-    print(f"{len(steps)} steps · {len(fails)} critical failures · report: docs/testnet_report.md")
-    return 1 if fails else 0
+    if unclean:
+        print(f"!!! EXPOSURE NOT FULLY CLEANED on {unclean}: see {_data_dir() / 'LEFTOVER_EXPOSURE.json'} and run "
+              "`python -m grokbot.testnet_validate --cleanup-only` (or close it on the testnet website).")
+    print(f"{len(steps)} steps · {len(fails)} critical failures"
+          + (" · RUN WAS INTERRUPTED" if RUN["interrupted"] else "") + f" · report: docs/testnet_report.md")
+    return 130 if RUN["interrupted"] else (1 if fails or unclean else 0)
 
 
 def main() -> None:
+    import signal
     ap = argparse.ArgumentParser(description="Binance TESTNET validation (never contacts production).")
     ap.add_argument("--market", choices=["spot", "futures", "both"], default="both")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--pipeline", action="store_true",
                     help="also run the full application lifecycle with an operator validation trade (needs GROK_PROFILE=testnet)")
     ap.add_argument("--direction", choices=["LONG", "SHORT"], default="LONG",
-                    help="validation trade direction (spot is always LONG)")
-    ap.add_argument("--wait-minutes", type=float, default=20.0, help="how long to wait for the exchange to trigger SL/TP")
+                    help="pipeline validation trade direction on futures (spot is always LONG)")
+    ap.add_argument("--wait-minutes", type=float, default=20.0, help="pipeline: wait for the exchange to trigger SL/TP")
+    ap.add_argument("--trigger-wait", type=float, default=10.0,
+                    help="exchange-triggered SL and TP tests: minutes to wait for each")
     ap.add_argument("--cleanup", choices=["close_all", "cancel_pending", "report"], default="close_all",
-                    help="end-of-test policy (positions are never closed while the exchange is unreachable)")
+                    help="pipeline end-of-test policy (positions are never closed while the exchange is unreachable)")
     ap.add_argument("--check", action="store_true", help="only verify prerequisites; place nothing")
+    ap.add_argument("--cleanup-only", action="store_true",
+                    help="only cancel run-created orders / flatten run-created exposure from a previous interrupted run")
     a = ap.parse_args()
     for h in (SPOT, FUT):
-        assert "testnet" in h, "harness may only target testnet hosts"
+        from .endpoints import require
+        require(h, "testnet", "harness host")
+    if os.environ.get("GROK_ALLOW_LIVE") == "1":
+        raise SystemExit("Refusing to run: GROK_ALLOW_LIVE=1 is set in this shell. Unset it for testnet validation.")
     if a.check:
-        raise SystemExit(preflight())
-    if a.market == "spot":
-        a.direction = "LONG"
-    raise SystemExit(asyncio.run(amain(a)))
+        raise SystemExit(preflight(a.symbol))
+    if a.cleanup_only:
+        f = _data_dir() / "testnet_baseline.json"
+        if not f.exists():
+            raise SystemExit("no testnet_baseline.json in GROK_DATA_DIR: nothing recorded to clean up")
+        BASELINES.update(json.loads(f.read_text()))
+        res = asyncio.run(guard())
+        print(json.dumps(res, indent=1, default=str))
+        raise SystemExit(0 if all(r.get("clean") for r in res.values()) else 1)
+    marker = _data_dir() / "LEFTOVER_EXPOSURE.json"
+    if marker.exists():
+        raise SystemExit(f"Refusing to run: {marker} reports exposure left by a previous run. "
+                         "Resolve it first with --cleanup-only.")
+
+    def _term(*_):
+        raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, _term)
+    try:
+        asyncio.run(amain(a))
+    except KeyboardInterrupt:
+        RUN["interrupted"] = True
+        print("\n!!! interrupted: running the end-of-run guard (cancel run orders, flatten run exposure)...")
+    except Exception as ex:  # noqa: BLE001
+        RUN["steps"].append({"market": "harness", "step": "unexpected error", "status": "FAIL",
+                             "note": f"{type(ex).__name__}: {ex}", "ts": time.time()})
+        print(f"\n!!! harness error: {ex}; running the end-of-run guard...")
+    while True:
+        try:
+            rc = asyncio.run(finish(a))
+            break
+        except KeyboardInterrupt:
+            print("guard must finish to leave the account clean; please wait (Ctrl-C again is ignored once)...")
+            RUN["interrupted"] = True
+    raise SystemExit(rc)
 
 
 if __name__ == "__main__":

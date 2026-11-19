@@ -1,16 +1,18 @@
 # Binance testnet validation report
 
-Run 2026-11-18 21:44:33 UTC · symbol BTCUSDT · host: vm
+> **NATURE OF RESULTS: ACTUAL EXCHANGE RESPONSES** from the Binance **TEST** environment (testnet.binance.vision, testnet.binancefuture.com) with test funds. No simulated or paper result appears in this report. Signatures and API keys are removed.
 
-Only Binance TEST environments are contacted (testnet.binance.vision, testnet.binancefuture.com). Responses below are the exchange's actual replies (signatures/keys removed).
+Run 2026-11-19 03:47:47 UTC · symbol BTCUSDT · host: vm · network: real Binance TEST network
+
+Status legend: PASS / FAIL = exchange response met / did not meet the expectation · SKIPPED = not executed (reason given) · exchange-triggered SL/TP tests report TRIGGERED or NOT_TRIGGERED (market did not reach the level in the window; never counted as a pass of that trigger).
 
 ## Spot — 0 pass · 3 fail · 2 skipped
 
 | # | Step | Result | Note | ms |
 |---:|---|:-:|---|---:|
-| 1 | connectivity + server time | FAIL |  | 181 |
-| 2 | clock sync (offset ms) | FAIL |  | 39 |
-| 3 | exchange filters (precision / min size / min notional) | FAIL |  | 40 |
+| 1 | connectivity + server time | FAIL |  | 382 |
+| 2 | clock sync (offset ms) | FAIL |  | 36 |
+| 3 | exchange filters (precision / min size / min notional) | FAIL |  | 36 |
 | 4 | market data | SKIPPED | https://testnet.binance.vision not reachable from this environment |  |
 | 5 | signed steps | SKIPPED | https://testnet.binance.vision not reachable from this environment |  |
 
@@ -49,11 +51,11 @@ Only Binance TEST environments are contacted (testnet.binance.vision, testnet.bi
 
 | # | Step | Result | Note | ms |
 |---:|---|:-:|---|---:|
-| 1 | connectivity + server time | PASS | serverTime 1795038271451 | 551 |
-| 2 | clock sync (offset ms) | PASS | offset 3 ms | 190 |
-| 3 | exchange filters (precision / min size / min notional) | PASS | min notional 50 | 355 |
-| 4 | market data (ticker, book, klines, depth) | PASS | bid 62382.00 / ask 62400.80 | 1110 |
-| 5 | signed request reaches exchange (dummy key → expected rejection) | PASS | exchange answered -2015 | 755 |
+| 1 | connectivity + server time | PASS | serverTime 1795060064896 | 652 |
+| 2 | clock sync (offset ms) | PASS | offset 2 ms | 188 |
+| 3 | exchange filters (precision / min size / min notional) | PASS | min notional 50 | 373 |
+| 4 | market data (ticker, book, klines, depth) | PASS | bid 63023.50 / ask 63026.70 | 1226 |
+| 5 | signed request reaches exchange (dummy key → expected rejection) | PASS | exchange answered -2015 | 839 |
 | 6 | account balances | SKIPPED | no testnet credentials (set GROK_TESTNET_FUTURES_KEY / _SECRET) |  |
 | 7 | commission rates | SKIPPED | no testnet credentials (set GROK_TESTNET_FUTURES_KEY / _SECRET) |  |
 | 8 | limit order + acknowledgement | SKIPPED | no testnet credentials (set GROK_TESTNET_FUTURES_KEY / _SECRET) |  |
@@ -75,12 +77,12 @@ Only Binance TEST environments are contacted (testnet.binance.vision, testnet.bi
 **1. connectivity + server time**
 ```json
 {
- "serverTime": 1795038271451
+ "serverTime": 1795060064896
 }
 ```
 **2. clock sync (offset ms)**
 ```json
-3
+2
 ```
 **3. exchange filters (precision / min size / min notional)**
 ```json
@@ -95,10 +97,10 @@ Only Binance TEST environments are contacted (testnet.binance.vision, testnet.bi
 **4. market data (ticker, book, klines, depth)**
 ```json
 {
- "last": "62382.00",
- "bid": "62382.00",
- "ask": "62400.80",
- "mark": "62370.59335145",
+ "last": "63025.60",
+ "bid": "63023.50",
+ "ask": "63026.70",
+ "mark": "63025.60000000",
  "funding": "0.00010000",
  "klines": 5,
  "depth_levels": [
@@ -140,9 +142,13 @@ Only Binance TEST environments are contacted (testnet.binance.vision, testnet.bi
 
 ## Exchange execution metrics (testnet application pipeline)
 
-_Not available: the application pipeline did not run (no credentials or GROK_PROFILE not testnet)._
+_Not available: the application pipeline did not run (no credentials, GROK_PROFILE not testnet, or interrupted)._
 
-## Final test-account state
+## End-of-run guard (always executed)
+
+* No exchange exposure was created by this run.
+
+## Final test-account state (queried from the exchange)
 
 **No testnet credentials supplied: no test account was queried and no order was placed.**
 

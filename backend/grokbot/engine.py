@@ -103,13 +103,15 @@ class Engine:
     def trade_client(self, env: str, market: str) -> BinanceClient | None:
         if env not in ("testnet", "live"):
             return None
+        if env == "live" and self.settings.profile == "testnet":
+            return None  # the testnet profile can never build a live trading client
         key = (env, market)
         if key not in self._trade_clients:
             creds = self.vault.get_credentials(market, env)
             if not creds:
                 return None
             self._trade_clients[key] = BinanceClient(self._base(env, market), market, creds[0], creds[1],
-                                                     transport=self._transport)
+                                                     transport=self._transport, env=env)
         return self._trade_clients[key]
 
     def reset_clients(self) -> None:
@@ -167,9 +169,15 @@ class Engine:
             if env == "live":
                 restr = await SpotAdapter(self.spot_data, BinanceClient(
                     self.settings.endpoints.spot_live, "spot", *self.vault.get_credentials(venue, env),
-                    transport=self._transport)).api_restrictions()
+                    transport=self._transport, env="live")).api_restrictions()
                 chk("withdrawals_disabled", not restr.get("enableWithdrawals"),
                     "API key must NOT have withdrawal permission" if restr.get("enableWithdrawals") else "withdrawals disabled")
+                chk("internal_transfer_disabled", not restr.get("enableInternalTransfer"),
+                    "API key must NOT allow internal transfers" if restr.get("enableInternalTransfer") else "internal transfers disabled")
+                chk("universal_transfer_disabled", not restr.get("permitsUniversalTransfer"),
+                    "API key must NOT allow universal transfers" if restr.get("permitsUniversalTransfer") else "universal transfers disabled")
+                chk("margin_disabled", not restr.get("enableMargin"),
+                    "margin trading permission should be off" if restr.get("enableMargin") else "margin disabled")
                 if venue == "futures":
                     chk("futures_enabled", restr.get("enableFutures"), f"enableFutures={restr.get('enableFutures')}")
                 else:
@@ -206,8 +214,9 @@ class Engine:
             v = (c or {}).get("verification") or {}
             add(f"live_{m}_credentials_verified", c and c.get("verified_at") and v.get("ok"),
                 "verified" if c and v.get("ok") else "store and verify live API keys")
-            wd = next((x for x in v.get("checks", []) if x["name"] == "withdrawals_disabled"), None)
-            add(f"live_{m}_withdrawals_disabled", wd and wd["ok"], wd["detail"] if wd else "not verified")
+            for chkname in ("withdrawals_disabled", "internal_transfer_disabled", "universal_transfer_disabled"):
+                wd = next((x for x in v.get("checks", []) if x["name"] == chkname), None)
+                add(f"live_{m}_{chkname}", wd and wd["ok"], wd["detail"] if wd else "not verified")
         rc = self.db.meta_get("live_risk_confirmed")
         add("risk_config_confirmed", rc == self.risk_config_hash(),
             "current risk configuration confirmed" if rc == self.risk_config_hash() else "confirm the current risk configuration")

@@ -58,6 +58,7 @@ class FakeBinance:
         self.hedge_mode = False
         self._oid = 1000
         self.cancels: list[str] = []
+        self.spot_bal: dict[str, float] = {"USDT": 10000.0, "BTC": 0.5}   # BTC 0.5 pre-existing holding
 
     # ------------------------------------------------------------ helpers
     def _json(self, data, status=200):
@@ -85,6 +86,10 @@ class FakeBinance:
         if market == "futures":
             amt = filled if side == "BUY" else -filled
             self.positions[sym] = round(self.positions.get(sym, 0.0) + amt, 8)
+        else:
+            b = sym[:-4]
+            self.spot_bal[b] = round(self.spot_bal.get(b, 0.0) + (filled if side == "BUY" else -filled), 8)
+            self.spot_bal["USDT"] = self.spot_bal.get("USDT", 0.0) + (-1 if side == "BUY" else 1) * filled * p
         o["fills"] = [{"price": f"{p:.8f}", "qty": f"{filled:.8f}", "commission": f"{fee:.8f}", "commissionAsset": "USDT"}]
         return o
 
@@ -149,8 +154,8 @@ class FakeBinance:
             return self._json({"enableWithdrawals": self.withdrawals_enabled, "enableSpotAndMarginTrading": True,
                                "enableFutures": True, "ipRestrict": True})
         if path == "/api/v3/account":
-            return self._json({"canTrade": True, "canWithdraw": False,
-                               "balances": [{"asset": "USDT", "free": "10000", "locked": "0"}]})
+            return self._json({"canTrade": True, "canWithdraw": False, "accountType": "SPOT", "permissions": ["SPOT"],
+                               "balances": [{"asset": k, "free": f"{v:.8f}", "locked": "0"} for k, v in self.spot_bal.items()]})
         if path in ("/fapi/v3/account",):
             return self._json({"assets": [{"asset": "USDT", "walletBalance": "5000", "availableBalance": "5000"}]})
         if path == "/fapi/v3/balance":
@@ -193,6 +198,13 @@ class FakeBinance:
                     return self._json({"code": -2011, "msg": "Unknown order sent."}, 400)
                 o["status"] = "CANCELED"
                 self.cancels.append(cid)
+                for lid, lst in self.order_lists.items():   # cancelling an OCO leg cancels the whole list
+                    legs = [x["clientOrderId"] for x in lst.get("orders", [])]
+                    if cid in legs:
+                        lst["listOrderStatus"] = "ALL_DONE"
+                        for leg in legs:
+                            if leg in self.orders and self.orders[leg]["status"] == "NEW":
+                                self.orders[leg]["status"] = "CANCELED"
                 return self._json({k: v for k, v in o.items() if k != "fills"})
             if request.method == "GET":
                 if cid not in self.orders:
@@ -222,7 +234,11 @@ class FakeBinance:
         if path == "/api/v3/orderList":
             lid = q.get("origClientOrderId") or q.get("listClientOrderId")
             if request.method == "DELETE":
-                self.order_lists.get(lid, {})["listOrderStatus"] = "ALL_DONE"
+                lst = self.order_lists.get(lid, {})
+                lst["listOrderStatus"] = "ALL_DONE"
+                for x in lst.get("orders", []):
+                    if self.orders.get(x["clientOrderId"], {}).get("status") == "NEW":
+                        self.orders[x["clientOrderId"]]["status"] = "CANCELED"
                 return self._json({"ok": True})
             return self._json(self.order_lists.get(lid, {"listOrderStatus": "ALL_DONE", "orders": []}))
         if path == "/fapi/v1/algoOrder":
@@ -304,6 +320,9 @@ class FakeBinance:
         qty = float(q["quantity"])
         o.update(status="FILLED", executedQty=f"{qty:.8f}", cummulativeQuoteQty=f"{qty * px:.8f}")
         self.orders[other]["status"] = "CANCELED"
+        b = q["symbol"][:-4]
+        self.spot_bal[b] = round(self.spot_bal.get(b, 0.0) - qty, 8)
+        self.spot_bal["USDT"] += qty * px
         self.trades.append({"symbol": q["symbol"], "orderId": o["orderId"], "side": "SELL", "qty": f"{qty:.8f}",
                             "price": f"{px:.8f}", "commission": f"{qty * px * 0.001:.8f}", "commissionAsset": "USDT",
                             "realizedPnl": "0", "time": int(time.time() * 1000), "market": "spot"})

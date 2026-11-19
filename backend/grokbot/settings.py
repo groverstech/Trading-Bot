@@ -54,6 +54,7 @@ class Settings:
     futures_data_is_testnet: bool = field(default=False)
     enable_streams: bool = True
     session_idle_minutes: int = 120
+    profile: str = ""
     cookie_secure: bool = False
 
 
@@ -70,7 +71,7 @@ def load_settings() -> Settings:
         os.environ.setdefault("GROK_FUTURES_DATA_URL", "https://testnet.binancefuture.com")
         os.environ.setdefault("GROK_FUTURES_WS_URL", "wss://fstream.binancefuture.com")
     futures_data = _env("GROK_FUTURES_DATA_URL", "https://fapi.binance.com")
-    return Settings(
+    s = Settings(
         data_dir=data_dir,
         db_path=Path(_env("GROK_DB_PATH", str(data_dir / "grokbot.db"))),
         host=_env("GROK_HOST", "127.0.0.1"),
@@ -90,11 +91,39 @@ def load_settings() -> Settings:
         enable_streams=_env("GROK_STREAMS", "1") == "1",
         fx_url=_env("GROK_FX_URL", "https://open.er-api.com/v6/latest/USD"),
         allow_live=_env("GROK_ALLOW_LIVE", "0") == "1",
+        profile=_env("GROK_PROFILE", ""),
         master_key_env=os.environ.get("GROK_MASTER_KEY"),
         admin_password_env=os.environ.get("GROK_ADMIN_PASSWORD"),
         session_hours=int(_env("GROK_SESSION_HOURS", "12")),
         session_idle_minutes=int(_env("GROK_SESSION_IDLE_MINUTES", "120")),
         cookie_secure=_env("GROK_COOKIE_SECURE", "0") == "1",
         frontend_dist=Path(_env("GROK_FRONTEND_DIST", str(root / "frontend" / "dist"))),
-        futures_data_is_testnet="testnet" in futures_data,
+        futures_data_is_testnet=__import__("grokbot.endpoints", fromlist=["is_testnet"]).is_testnet(futures_data),
     )
+    return validate(s)
+
+
+def validate(s: Settings) -> Settings:
+    """Refuse to start with an unsafe endpoint / mode combination."""
+    from .endpoints import EndpointError, is_testnet, require
+    ep = s.endpoints
+    require(ep.spot_testnet, "testnet", "GROK_SPOT_TESTNET_URL")
+    require(ep.futures_testnet, "testnet", "GROK_FUTURES_TESTNET_URL")
+    require(ep.futures_ws_testnet, "testnet", "GROK_FUTURES_TESTNET_WS_URL")
+    require(ep.spot_live, "live", "GROK_SPOT_LIVE_URL")
+    require(ep.futures_live, "live", "GROK_FUTURES_LIVE_URL")
+    if s.profile == "testnet":
+        for name, url in (("GROK_SPOT_DATA_URL", ep.spot_data), ("GROK_FUTURES_DATA_URL", ep.futures_data),
+                          ("GROK_SPOT_WS_URL", ep.spot_ws), ("GROK_FUTURES_WS_URL", ep.futures_ws)):
+            require(url, "testnet", name)
+        if s.allow_live:
+            raise EndpointError("GROK_ALLOW_LIVE=1 is not permitted with GROK_PROFILE=testnet")
+    for name, url in (("GROK_SPOT_DATA_URL", ep.spot_data), ("GROK_FUTURES_DATA_URL", ep.futures_data)):
+        if not (is_testnet(url) or require_quiet(url)):
+            raise EndpointError(f"{name} = {url!r} is not a known Binance host")
+    return s
+
+
+def require_quiet(url: str) -> bool:
+    from .endpoints import is_production
+    return is_production(url)

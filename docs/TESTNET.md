@@ -1,5 +1,7 @@
 # Binance testnet validation: status and exact local procedure
 
+> **Phase 3:** the readiness checklist (isolation, credential safety, no withdrawals or transfers, live lockout, preflight, exchange-triggered SL/TP tests, interruption-safe cleanup, report labelling) and the authoritative setup steps are in [`PHASE3_READINESS.md`](PHASE3_READINESS.md). Follow that file. This document gives background and the step reference.
+
 ## 1. Status (honest summary)
 
 | Item | Status |
@@ -76,12 +78,16 @@ export GROK_TESTNET_FUTURES_KEY=...   GROK_TESTNET_FUTURES_SECRET=...
 ```bash
 python -m grokbot.testnet_validate --check
 ```
-Expected output: every line `OK`, ending with `13/13 prerequisites met`, exit code 0. Fix any `FAIL` line first. A typical failure is `spot testnet reachable: HTTP Error 451`, meaning your network or region is blocked.
+Expected output: grouped `[environment]`, `[safety]`, `[spot]`, `[futures]` sections with every line `OK` (or `INFO`), ending with `N/N readiness checks passed`, exit code 0. Fix any `FAIL` line first. Typical failures:
+* `testnet reachable … 451`: your network or region is blocked.
+* `credentials accepted … -2015`: a wrong key, or a production key, was supplied.
+* `no pre-existing BTCUSDT position / orders`: close them on the testnet website.
 
 **Step 5: run the full validation.**
 ```bash
 python -m grokbot.testnet_validate --market both --pipeline
-#   options: --wait-minutes 20       how long to wait for the exchange to fire SL/TP
+#   options: --trigger-wait 10       minutes per exchange-triggered TAKE-PROFIT and STOP-LOSS test
+#            --wait-minutes 20       how long the application lifecycle waits for the exchange to fire SL/TP
 #            --direction SHORT        futures validation trade direction (spot is always LONG)
 #            --cleanup close_all      end-of-test policy: close_all | cancel_pending | report
 #            --symbol BTCUSDT

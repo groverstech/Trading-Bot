@@ -62,6 +62,10 @@ class Vault:
             raise ValueError("API key/secret length looks invalid")
         if not all(c.isalnum() for c in api_key + api_secret):
             raise ValueError("API key/secret must be alphanumeric (HMAC keys)")
+        other = self.get_credentials(venue, "live" if env == "testnet" else "testnet")
+        if other and other[0] == api_key:
+            raise ValueError(f"this API key is already stored as a {'live' if env == 'testnet' else 'testnet'} key; "
+                             "testnet and production keys must be different")
         cid = self.cred_id(venue, env)
         self.db.execute(
             "INSERT INTO credentials(id,venue,env,api_key_enc,api_secret_enc,key_hint,created_at) "

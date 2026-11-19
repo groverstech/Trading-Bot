@@ -25,6 +25,15 @@ def fake():
     return FakeBinance()
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_env(monkeypatch):
+    """Tests never see the operator's environment (profiles, URLs, real keys)."""
+    import os
+    for k in list(os.environ):
+        if k.startswith("GROK_"):
+            monkeypatch.delenv(k, raising=False)
+
+
 @pytest.fixture
 def settings(tmp_path, monkeypatch):
     monkeypatch.setenv("GROK_DATA_DIR", str(tmp_path))

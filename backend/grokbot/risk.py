@@ -89,8 +89,9 @@ class RiskEngine:
         ok, why = self.exchange_ok(mode, market)
         add("exchange_connectivity", ok, why)
         if mode in ("testnet", "live"):
+            from .endpoints import is_testnet
             src = self.md.adapters[market].data.base_url
-            is_test = "testnet" in src
+            is_test = is_testnet(src)
             add("data_source_matches_mode", is_test == (mode == "testnet"),
                 f"{market} market data from {src} ({'testnet' if is_test else 'production'}) for {mode} orders")
         age = self.md.age(market, symbol)

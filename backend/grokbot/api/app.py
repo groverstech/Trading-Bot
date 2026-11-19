@@ -546,7 +546,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, s
         path = e.settings.data_dir / "walkforward.json"
         if not path.exists():
             return {"available": False, "how": "run: python -m grokbot.research --apply"}
-        d = json.loads(path.read_text())
+        d = json.loads(path.read_text(encoding="utf-8"))
         rows = []
         for r in d["results"]:
             rows.append({k: r.get(k) for k in ("strategy", "timeframe", "scenario", "oos", "checks", "promote",

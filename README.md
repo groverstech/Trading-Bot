@@ -49,7 +49,8 @@ For frontend development, run `npm run dev` in `frontend/`. It proxies `/api` an
 * `docs/paper_session_report.md`: end-to-end paper-trading evidence.
 * `docs/AUDIT.md`: financial and security audit.
 * `docs/PHASE2_1_REPORT.md`: ETH stop investigation, open-position resolution, testnet lifecycle validation.
-* `docs/PHASE3_READINESS.md`: readiness checklist and exact local setup for real testnet validation.
+* `docs/PHASE3_READINESS.md`: readiness checklist for real testnet validation.
+* `docs/WINDOWS_SETUP.md`: Windows PowerShell setup, secure credential entry, preflight, execution and cleanup verification (`scripts/windows/`).
 
 ### Environment variables
 

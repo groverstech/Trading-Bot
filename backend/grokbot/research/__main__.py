@@ -85,10 +85,10 @@ def main() -> None:
            "windows": wf.WINDOWS, "scenarios": wf.SCENARIOS, "grids": wf.GRIDS, "symbols": SYMBOLS,
            "results": results}
     path = Path(a.out or (s.data_dir / "walkforward.json"))
-    path.write_text(json.dumps(out, default=str))
+    path.write_text(json.dumps(out, default=str), encoding="utf-8")
     md = render(out)
     docs = Path(__file__).resolve().parents[3] / "docs" / "strategy_report.md"
-    docs.write_text(md)
+    docs.write_text(md, encoding="utf-8")
     print(f"wrote {path} and {docs}")
     if a.apply:
         from ..config_store import ConfigStore

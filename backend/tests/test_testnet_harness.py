@@ -73,6 +73,9 @@ async def test_futures_lifecycle_exchange_stop_reconciled_and_flat(monkeypatch, 
     assert m["nature"].startswith("EXCHANGE")
     assert fake.positions.get("ETHUSDT", 0) == 0
     assert "7. exchange-side SL/TP present and valid (queried from the exchange)" in status
+    import sqlite3
+    left = sqlite3.connect(str(tmp_path / "pipe" / "grokbot.db")).execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
+    assert left == 0          # testnet keys removed from the app vault after the run
 
 
 @pytest.mark.safety

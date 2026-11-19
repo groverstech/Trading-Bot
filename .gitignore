@@ -11,3 +11,8 @@ master.key
 .env
 .venv/
 *.whl
+
+# testnet / phase-3 runtime data (encrypted DB, master key, reports): never commit
+data-*/
+*testnet_baseline.json
+LEFTOVER_EXPOSURE.json

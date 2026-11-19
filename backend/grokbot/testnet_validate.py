@@ -112,7 +112,7 @@ def _data_dir() -> Path:
 
 
 def _save_baselines() -> None:
-    (_data_dir() / "testnet_baseline.json").write_text(json.dumps(BASELINES))
+    (_data_dir() / "testnet_baseline.json").write_text(json.dumps(BASELINES), encoding="utf-8")
 
 
 async def emergency_cleanup(market: str, symbol: str, key: str, secret: str, base0: str) -> dict:
@@ -185,7 +185,7 @@ async def guard() -> dict:
         res[m] = await emergency_cleanup(m, b["symbol"], key, sec, b.get("base0", "0"))
     marker = _data_dir() / "LEFTOVER_EXPOSURE.json"
     if any(not r.get("clean") for r in res.values()):
-        marker.write_text(json.dumps(res, default=str, indent=1))
+        marker.write_text(json.dumps(res, default=str, indent=1), encoding="utf-8")
     elif marker.exists():
         marker.unlink()
     return res
@@ -777,6 +777,10 @@ async def run_pipeline(market: str, symbol: str, key: str | None, secret: str | 
                           "ts": time.time()})
         return rec.steps, exec_metrics.compute(e.db, "testnet")
     finally:
+        try:   # keys live only in the operator's shell session: remove them from the app vault
+            e.vault.delete_credentials(market, "testnet")
+        except Exception:  # noqa: BLE001
+            pass
         await e.close()
 
 
@@ -879,7 +883,8 @@ def preflight(symbol: str = "BTCUSDT", run_tests: bool = True) -> int:
         root = Path(__file__).resolve().parents[1]
         clean_env = {k: v for k, v in os.environ.items() if not k.startswith("GROK_")}   # never pass keys to tests
         r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-m", "safety", "-p", "no:cacheprovider", str(root / "tests")],
-                           cwd=str(root), capture_output=True, text=True, env=clean_env)
+                           cwd=str(root), capture_output=True, text=True, env=clean_env,
+                           encoding="utf-8", errors="replace")
         last = [x for x in r.stdout.strip().splitlines() if x.strip()][-1:] or ["no output"]
         chk("safety", "automated safety test suite", r.returncode == 0, last[0][:120])
     group = None
@@ -892,7 +897,7 @@ def preflight(symbol: str = "BTCUSDT", run_tests: bool = True) -> int:
     req = [r_ for r_ in rows if r_[2] is not None]
     print(f"\n{len(req) - len(bad)}/{len(req)} readiness checks passed" + ("" if not bad else " — fix every FAIL before running"))
     (_data_dir() / "testnet_preflight.json").write_text(json.dumps(
-        [{"group": g, "check": n, "ok": o, "detail": d} for g, n, o, d in rows], indent=1))
+        [{"group": g, "check": n, "ok": o, "detail": d} for g, n, o, d in rows], indent=1), encoding="utf-8")
     return 1 if bad else 0
 
 
@@ -991,7 +996,7 @@ async def finish(a) -> int:
     acct = await account_state(*creds["spot"], *creds["futures"]) if any(k for k, _ in creds.values()) else \
         {"statement": "No testnet credentials supplied: no test account was queried and no order was placed."}
     real = TRANSPORT is None
-    meta = {"ts": time.time(), "symbol": a.symbol, "host": os.uname().nodename, "pipeline": a.pipeline,
+    meta = {"ts": time.time(), "symbol": a.symbol, "host": __import__("platform").node(), "pipeline": a.pipeline,
             "cleanup": a.cleanup, "wait_minutes": a.wait_minutes, "trigger_wait": a.trigger_wait,
             "interrupted": RUN["interrupted"], "network": "real Binance TEST network" if real else "MOCK exchange (automated test)"}
     steps = RUN["steps"]
@@ -1011,10 +1016,10 @@ async def finish(a) -> int:
     if real:   # never let a mock run overwrite the real report
         root = Path(__file__).resolve().parents[2]
         (root / "docs").mkdir(exist_ok=True)
-        (root / "docs" / "testnet_report.md").write_text(md)
+        (root / "docs" / "testnet_report.md").write_text(md, encoding="utf-8")
     (_data_dir() / "testnet_report.json").write_text(json.dumps({"meta": meta, "steps": steps, "metrics": RUN["metrics"],
-                                                                 "guard": RUN["guard"], "account": acct}, default=str, indent=1))
-    (_data_dir() / "testnet_report.md").write_text(md)
+                                                                 "guard": RUN["guard"], "account": acct}, default=str, indent=1), encoding="utf-8")
+    (_data_dir() / "testnet_report.md").write_text(md, encoding="utf-8")
     fails = [x for x in steps if x["status"] == "FAIL" and x.get("critical", True)]
     unclean = [m for m, g in RUN["guard"].items() if not g.get("clean")]
     print(f"\n{acct['statement']}")
@@ -1028,6 +1033,12 @@ async def finish(a) -> int:
 
 def main() -> None:
     import signal
+    import sys
+    for stream in (sys.stdout, sys.stderr):      # never crash on a console that cannot show ≤ → —
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
     ap = argparse.ArgumentParser(description="Binance TESTNET validation (never contacts production).")
     ap.add_argument("--market", choices=["spot", "futures", "both"], default="both")
     ap.add_argument("--symbol", default="BTCUSDT")
@@ -1055,7 +1066,7 @@ def main() -> None:
         f = _data_dir() / "testnet_baseline.json"
         if not f.exists():
             raise SystemExit("no testnet_baseline.json in GROK_DATA_DIR: nothing recorded to clean up")
-        BASELINES.update(json.loads(f.read_text()))
+        BASELINES.update(json.loads(f.read_text(encoding="utf-8")))
         res = asyncio.run(guard())
         print(json.dumps(res, indent=1, default=str))
         raise SystemExit(0 if all(r.get("clean") for r in res.values()) else 1)

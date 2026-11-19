@@ -198,7 +198,7 @@ async def amain(a) -> None:
         rep["downtime_notes"] = notes
         print(render(rep))
         if a.json:
-            open(a.json, "w").write(dumps(rep))
+            open(a.json, "w", encoding="utf-8").write(dumps(rep))
     finally:
         await e.close()
 

@@ -93,7 +93,7 @@ def test_codebase_has_no_withdrawal_or_transfer_calls():
     for f in root.rglob("*.py"):
         if f.name == "endpoints.py":
             continue
-        for i, line in enumerate(f.read_text().splitlines(), 1):
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
             if re.search(r'["\']/(sapi|wapi)/v\d/(capital|asset|sub-account|futures/transfer|margin)', line):
                 hits.append(f"{f.name}:{i}")
     assert hits == []

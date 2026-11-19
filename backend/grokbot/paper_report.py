@@ -116,13 +116,13 @@ def main() -> None:
     a = ap.parse_args()
     dbs = a.db or [str(load_settings().db_path)]
     titles = a.title or [None] * len(dbs)
-    parts = [Path(a.preface).read_text()] if a.preface else []
+    parts = [Path(a.preface).read_text(encoding="utf-8")] if a.preface else []
     for path, title in zip(dbs, titles):
         md = render(Database(path))
         if title:
             md = md.replace("# Paper-trading session evidence", f"# {title}", 1)
         parts.append(md)
-    Path(a.out).write_text("\n\n---\n\n".join(parts))
+    Path(a.out).write_text("\n\n---\n\n".join(parts), encoding="utf-8")
     print("wrote", a.out)
 
 

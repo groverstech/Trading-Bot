@@ -6,7 +6,7 @@ Every command works in **Windows PowerShell 5.1** (built into Windows) and in **
 
 **A1. Prerequisites** (once):
 * **Git for Windows**: https://git-scm.com/download/win. Defaults are fine; Git Credential Manager handles GitHub sign-in.
-* **Python 3.12 or 3.13 (64-bit)**: https://www.python.org/downloads/windows/. In the installer, tick **"Add python.exe to PATH"** and keep the **py launcher**.
+* **Python 3.13 (64-bit)** (3.12 also works; do not use 3.14, which may lack prebuilt wheels): https://www.python.org/downloads/windows/. In the installer, tick **"Add python.exe to PATH"** and keep the **py launcher**.
 * An accurate clock: Settings → Time & language → Date & time → **Sync now**. The preflight requires an offset under 1 second.
 
 **A2. Clone, create the virtual environment, install, test:**
@@ -18,15 +18,15 @@ git checkout ccr-2e138369-wawg3y
 git pull
 cd backend
 
-py -3 --version                                   # must print Python 3.12.x or 3.13.x
-py -3 -m venv .venv
+py -3.13 --version                                # must print Python 3.13.x (use -3.12 if you installed 3.12)
+py -3.13 -m venv .venv
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force   # this window only; needed for .ps1 files
 .\.venv\Scripts\Activate.ps1                      # prompt now starts with (.venv)
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt -c constraints.txt   # pinned to the verified versions
 
 $env:PYTHONUTF8 = "1"
-python -m pytest -q                               # expect: "108 passed" (takes ~3 minutes)
+python -m pytest -q                               # expect: "110 passed" (takes ~3 minutes)
 ```
 If the repository is private, `git clone` opens a GitHub sign-in window. That is Git's own credential manager; it has nothing to do with Binance keys.
 
@@ -47,7 +47,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 ```
 * It prompts four times: `GROK_TESTNET_SPOT_KEY`, `GROK_TESTNET_SPOT_SECRET`, `GROK_TESTNET_FUTURES_KEY`, `GROK_TESTNET_FUTURES_SECRET`.
 * Paste each value and press **Enter**. Nothing is shown; it only confirms "set (64 characters, value not shown)".
-* Values are stored **only in this window's process environment**. They are not written to disk, not added to PSReadLine history (only the command line above is recorded), and not committed.
+* Values are stored **only in this window's process environment** (inherited by the `python` commands you start from this window, which is how they reach the harness). They are not written to disk, not added to PSReadLine history (only the command line above is recorded), and not committed.
 * The script also sets `GROK_PROFILE=testnet`, `GROK_DATA_DIR=...\backend\data-testnet` and `PYTHONUTF8=1`, removes `GROK_ALLOW_LIVE`, and clears the clipboard.
 * If Windows clipboard history (Win+V) is enabled, clear it afterwards: Settings → System → Clipboard → **Clear**.
 
@@ -62,10 +62,12 @@ Expected:
 * no red WARNING lines. A red line means a key or `GROK_ALLOW_LIVE` is set permanently at User or Machine level; remove it in System Properties → Environment Variables.
 
 **B4. Preflight (READ-ONLY: places no orders):**
+
+The preflight's exchange clients are built in read-only mode: any non-GET request (place, modify, cancel) is refused in code before it reaches the network, and a safety test enforces this. Its only writes are local files under `GROK_DATA_DIR` (`testnet_preflight.json`, and the app's local database with default settings if it does not exist yet).
 ```powershell
 python -m grokbot.testnet_validate --check
 ```
-It takes 1–2 minutes, because it also runs the 76-test safety suite in a clean environment that never sees your keys. Every line must read `OK` (or `INFO`), ending with `N/N readiness checks passed`:
+It takes 1–2 minutes, because it also runs the 78-test safety suite in a clean environment that never sees your keys. Every line must read `OK` (or `INFO`), ending with `N/N readiness checks passed`:
 
 | Group | Checks |
 |---|---|
@@ -79,7 +81,7 @@ Fix every `FAIL` before going further:
 * "clock offset" FAIL: use **Sync now** in Windows time settings.
 * "testnet reachable … 451": your network or region is blocked.
 
-**STOP HERE and report the preflight result before running anything that places orders.**
+**STOP HERE and report the preflight result.** Do not run anything from section C marked "YES", and do not start the app, until the next stage is explicitly approved. When you are done for now, run `& ..\scripts\windows\clear-testnet-keys.ps1` and close the window.
 
 ## C. Commands that may place TESTNET orders
 

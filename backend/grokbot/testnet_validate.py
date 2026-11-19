@@ -44,10 +44,11 @@ FUT_WS = "wss://fstream.binancefuture.com"
 TRANSPORT = None  # tests inject a mock transport here
 
 
-def _client(base, market, key=None, secret=None):
+def _client(base, market, key=None, secret=None, readonly=False):
     from .endpoints import require
     require(base, "testnet", "harness endpoint")       # the harness never talks to production
-    return BinanceClient(base, market, key, secret, transport=TRANSPORT, env="testnet" if key else None)
+    return BinanceClient(base, market, key, secret, transport=TRANSPORT, env="testnet" if key else None,
+                         readonly=readonly)
 
 
 def _scrub(o):
@@ -904,7 +905,7 @@ def preflight(symbol: str = "BTCUSDT", run_tests: bool = True) -> int:
 async def _preflight_market(market: str, symbol: str, key: str | None, secret: str | None) -> list:
     out = []
     base = SPOT if market == "spot" else FUT
-    pub = _client(base, market)
+    pub = _client(base, market, readonly=True)
     ad = SpotAdapter(pub) if market == "spot" else FuturesAdapter(pub)
     try:
         off = await pub.sync_time()
@@ -918,7 +919,7 @@ async def _preflight_market(market: str, symbol: str, key: str | None, secret: s
     if not key:
         await pub.close()
         return out
-    tc = _client(base, market, key, secret)
+    tc = _client(base, market, key, secret, readonly=True)
     sa = SpotAdapter(pub, tc) if market == "spot" else FuturesAdapter(pub, tc)
     try:
         if market == "spot":

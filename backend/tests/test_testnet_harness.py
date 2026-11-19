@@ -187,3 +187,37 @@ async def test_guard_writes_leftover_marker_when_exchange_unreachable(monkeypatc
 
 async def _nosleep(*a, **k):
     return None
+
+
+@pytest.mark.safety
+def test_preflight_is_strictly_read_only(monkeypatch, tmp_path, capsys):
+    """--check with valid-format keys against the mock exchange: every exchange
+    request must be a GET; nothing is placed, modified or cancelled."""
+    monkeypatch.setenv("GROK_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GROK_PROFILE", "testnet")
+    for m in ("SPOT", "FUTURES"):
+        monkeypatch.setenv(f"GROK_TESTNET_{m}_KEY", "K" * 64)
+        monkeypatch.setenv(f"GROK_TESTNET_{m}_SECRET", "S" * 64)
+    fake = FakeBinance()
+    monkeypatch.setattr(tv, "TRANSPORT", fake.transport())
+    tv.preflight(run_tests=False)
+    out = capsys.readouterr().out
+    assert "credentials accepted by testnet (signed read): " in out
+    assert fake.calls and {c[0] for c in fake.calls} == {"GET"}, {c[:2] for c in fake.calls if c[0] != "GET"}
+    assert "K" * 64 not in out and "S" * 64 not in out                      # secrets never printed
+    assert "K" * 64 not in (tmp_path / "testnet_preflight.json").read_text(encoding="utf-8")
+
+
+@pytest.mark.safety
+async def test_readonly_client_refuses_writes_before_network():
+    import httpx
+    from grokbot.endpoints import EndpointError
+    from grokbot.exchange.client import BinanceClient
+    calls = []
+    c = BinanceClient("https://testnet.binancefuture.com", "futures", "K" * 64, "S" * 64, env="testnet", readonly=True,
+                      transport=httpx.MockTransport(lambda r: calls.append(r) or httpx.Response(200, json={})))
+    for method, path in (("POST", "/fapi/v1/order"), ("DELETE", "/fapi/v1/order"), ("POST", "/fapi/v1/algoOrder")):
+        with pytest.raises(EndpointError, match="read-only"):
+            await c.request(method, path, {"symbol": "BTCUSDT"}, signed=True)
+    assert calls == []
+    await c.close()

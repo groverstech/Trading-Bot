@@ -14,7 +14,7 @@ SCANNER → RUG CHECK → SIZER → CENTRAL RISK → EXECUTOR → LOGGER → EQU
 # backend (Python ≥ 3.11)
 cd backend
 pip install -r requirements.txt
-python -m pytest -q                      # 108 tests (76 marked "safety")
+python -m pytest -q                      # 110 tests (78 marked "safety")
 
 # frontend
 cd ../frontend

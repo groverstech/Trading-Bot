@@ -71,7 +71,8 @@ class Health:
 class BinanceClient:
     def __init__(self, base_url: str, kind: str, api_key: str | None = None,
                  api_secret: str | None = None, weight_limit: int | None = None,
-                 timeout: float = 10.0, transport: httpx.AsyncBaseTransport | None = None, env: str | None = None):
+                 timeout: float = 10.0, transport: httpx.AsyncBaseTransport | None = None, env: str | None = None,
+                 readonly: bool = False):
         assert kind in ("spot", "futures")
         self.base_url = base_url.rstrip("/")
         self.kind = kind
@@ -82,6 +83,7 @@ class BinanceClient:
                 raise ValueError("credentialed client requires env='testnet' or 'live'")
             require(base_url, env, f"{kind} trading endpoint")
         self.env = env
+        self.readonly = readonly   # read-only clients refuse every non-GET request (used by the preflight)
         self._key = api_key
         self._secret = api_secret.encode() if api_secret else None
         self.health = Health(weight_limit=weight_limit or (6000 if kind == "spot" else 2400))
@@ -136,6 +138,9 @@ class BinanceClient:
         params = {k: v for k, v in (params or {}).items() if v is not None}
         if retries is None:
             retries = 0 if (order or method != "GET") else 3
+        if self.readonly and method != "GET":
+            from ..endpoints import EndpointError
+            raise EndpointError(f"read-only client refused {method} {path}")
         if signed or api_key_only:
             from ..endpoints import check_signed
             check_signed(method, path)
